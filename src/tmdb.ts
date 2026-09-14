@@ -28,10 +28,18 @@ export function cleanMediaTitle(rawTitle: string): { query: string; year?: strin
   // Remove file extensions
   str = str.replace(/\.(mp4|mkv|avi|m4v|mov|mp3|flac|aac)$/i, "");
 
-  // Remove common scene tags (added MP4, MKV, AVI, WEB, DL)
+  // Remove generic provider prefixes/suffixes like @PortaliMovies
+  str = str.replace(/@PortaliMovies/gi, "");
   str = str.replace(/BaixarSeriesMP4(\.pm)?/gi, "");
-  str = str.replace(/\b(1080p|720p|480p|2160p|4k|uhd|fhd|hd|web-dl|webdl|web|dl|bluray|bdrip|dvdrip|x264|x265|hevc|aac|mp3|mp4|mkv|avi|ddp5\.1|ac3)\b/gi, "");
-  str = str.replace(/\b(LEG|DUB|DUBLADO|LEGENDADO|NACIONAL)\b/gi, "");
+
+  // Remove general resolution and codec tags
+  str = str.replace(/\b(?:1080p|720p|480p|2160p|4k|uhd|fhd|hd|web-dl|webdl|web|dl|bluray|bdrip|dvdrip|x264|x265|hevc|aac|mp3|mp4|mkv|avi|ddp5\.1|ac3|AMZN|WEBrip|HC|AAC2 0|H264|BCN|DDP5 1|tt\d+|PiA|OLYMPUS|Lat|Latino|WORLD|LAMA)\b/gi, " ");
+
+  // Remove trailing audio/dub and scene tags cleanly via split (taking the left part)
+  str = str.split(/\b(?:DUAL|5 1|5\.1|PT BR|PT-BR|HELLCASE|NF|Atmos|H 264|H\.264|iT|DD5|C76|NNO|YTS|MX|AAC5|LAMA|DCPRIP|SYNCx264|DKS|WEBRip|HDCAM|SCOPE|NaNi|Full3R|DDP2 0|2 0|Sf|LEG|DUB|DUBLADO|LEGENDADO|NACIONAL)\b/i)[0];
+
+  // Collapse multiple spaces
+  str = str.replace(/\s+/g, ' ').trim();
 
   // Remove season / episode tags if present (e.g. S01E02)
   str = str.replace(/S\d+E\d+/gi, "");
