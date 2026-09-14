@@ -194,5 +194,67 @@ export async function runSync(env: any) {
     }
   }
 
+  // Background TMDB Metadata Enrichment
+  try {
+    console.log("Running background TMDB metadata enrichment...");
+    const { searchTmdb, getTmdbDetails } = await import('./tmdb');
+    
+    const missingMetadata = await env.DB.prepare("SELECT * FROM Items WHERE TmdbId IS NULL AND (Type = 'Movie' OR Type = 'Series') LIMIT 50").all();
+    
+    if (missingMetadata.results && missingMetadata.results.length > 0) {
+      console.log(`Enriching ${missingMetadata.results.length} items with TMDB metadata...`);
+      for (const row of missingMetadata.results) {
+         const searchRes = await searchTmdb(env.TMDB_API_KEY, row.Name, row.Type);
+         if (searchRes) {
+            const tmdbDet = await getTmdbDetails(env.TMDB_API_KEY, searchRes.id, row.Type);
+            if (tmdbDet) {
+                const mediaInfoStr = JSON.stringify({
+                  tmdb: {
+                    id: tmdbDet.id,
+                    title: tmdbDet.title,
+                    overview: tmdbDet.overview,
+                    tagline: tmdbDet.tagline,
+                    genres: tmdbDet.genres,
+                    people: tmdbDet.people,
+                    studios: tmdbDet.studios,
+                    voteAverage: tmdbDet.voteAverage,
+                    releaseDate: tmdbDet.releaseDate,
+                    posterPath: tmdbDet.posterPath,
+                    backdropPath: tmdbDet.backdropPath,
+                  }
+                });
+                
+                await env.DB.prepare(`
+                  UPDATE Items SET 
+                    TmdbId = ?, 
+                    PrimaryImageFileId = COALESCE(PrimaryImageFileId, ?), 
+                    BackdropImageFileId = COALESCE(BackdropImageFileId, ?),
+                    Overview = COALESCE(Overview, ?),
+                    Name = ?,
+                    MediaInfo = ?
+                  WHERE Id = ?
+                `).bind(
+                  searchRes.id, 
+                  tmdbDet.posterPath, 
+                  tmdbDet.backdropPath, 
+                  tmdbDet.overview,
+                  tmdbDet.title || row.Name,
+                  mediaInfoStr,
+                  row.Id
+                ).run();
+            } else {
+                // Fallback if details fail
+                await env.DB.prepare("UPDATE Items SET TmdbId = ?, Name = ? WHERE Id = ?").bind(searchRes.id, searchRes.title || row.Name, row.Id).run();
+            }
+         } else {
+            // Mark as searched so we don't retry every time in the next runs (could use a dummy TMDB ID like -1)
+            await env.DB.prepare("UPDATE Items SET TmdbId = ? WHERE Id = ?").bind("-1", row.Id).run();
+         }
+      }
+    }
+  } catch (err) {
+    console.error("Error auto-fetching TMDB metadata:", err);
+  }
+
   return { success: true };
 }
