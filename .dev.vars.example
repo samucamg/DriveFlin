@@ -1,0 +1,14 @@
+﻿# Google Drive API (OAuth 2.0 Client Credentials)
+GDRIVE_CLIENT_ID="your_google_client_id.apps.googleusercontent.com"
+GDRIVE_CLIENT_SECRET="your_google_client_secret"
+GDRIVE_REFRESH_TOKEN="your_google_refresh_token"
+
+# Optional: Shared Drive / Team Drive ID (leave empty if using standard My Drive)
+GDRIVE_TEAM_DRIVE_ID=""
+
+# TMDB API Key for metadata and posters enrichment
+TMDB_API_KEY="your_tmdb_api_key_here"
+
+# Optional: Rclone Crypt password and salt if media files have encrypted names
+RCLONE_PASS=""
+RCLONE_SALT=""

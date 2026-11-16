@@ -1,0 +1,62 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment variables and secrets
+.dev.vars
+.env
+.env.*
+!.dev.vars.example
+*.pem
+*.key
+*.bak
+*.ps1
+upload-secrets*
+
+# Wrangler & Cloudflare internal state
+.wrangler/
+.wrangler.state/
+
+# Build and dist files
+dist/
+*.log
+
+# Large media test binaries
+*.mp4
+*.mkv
+*.mp3
+*.avi
+*.flac
+*.m4a
+test.*
+test2.*
+
+# Backup dumps and temporary scratch files
+*.backup*
+backups/
+logos jellyfin/
+temp_update.sql
+
+clean.sql
+clean_db.py
+updates.sql
+insert.sql
+*.tmp
+*run_sync*
+*debug*.json
+openapi.json
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Standalone Documentation Website for VPS (not tracked in core repo)
+website_vps/
+
+
+# Local Python test and analysis scripts
+*.py
+scripts/
+sdk_*.kt
