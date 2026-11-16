@@ -8,7 +8,7 @@ export interface TmdbResult {
   releaseDate: string;
 }
 
-const DEFAULT_TMDB_API_KEY = "844dba0bfd8f3a4f3799f6130ef9e335";
+// v2: sem chave embutida. Configure TMDB_API_KEY como secret do Worker.
 
 const TMDB_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -19,7 +19,7 @@ export function getEffectiveKey(apiKey?: string): string {
   if (apiKey && typeof apiKey === 'string' && apiKey.trim() && apiKey.trim() !== '""') {
     return apiKey.trim();
   }
-  return DEFAULT_TMDB_API_KEY;
+  return "";
 }
 
 export function cleanMediaTitle(rawTitle: string): { query: string; year?: string } {
@@ -85,6 +85,7 @@ export async function searchTmdb(
   type: "Movie" | "Series" | "Episode" | "Season"
 ): Promise<TmdbResult | null> {
   const key = getEffectiveKey(apiKey);
+  if (!key) return null;
   const { query, year } = cleanMediaTitle(title);
   if (!query) return null;
 
@@ -181,6 +182,7 @@ export async function getTmdbDetails(
   type: "Movie" | "Series"
 ): Promise<TmdbFullDetails | null> {
   const key = getEffectiveKey(apiKey);
+  if (!key) return null;
   const endpoint = type === "Movie" ? "movie" : "tv";
   const url = `https://api.themoviedb.org/3/${endpoint}/${tmdbId}?api_key=${key}&language=pt-BR&append_to_response=credits`;
 
@@ -240,6 +242,7 @@ export async function getTvSeasonEpisodes(
   const key = getEffectiveKey(apiKey);
   const url = `https://api.themoviedb.org/3/tv/${tvId}/season/${seasonNumber}?api_key=${key}&language=pt-BR`;
   const epMap = new Map<number, { name: string; overview: string; stillPath: string | null; voteAverage: number }>();
+  if (!key) return epMap;
 
   try {
     const res = await fetch(url, { headers: TMDB_HEADERS });
@@ -285,6 +288,7 @@ export async function searchTmdbRemote(
   imdbId?: string
 ): Promise<RemoteSearchResultItem[]> {
   const key = getEffectiveKey(apiKey);
+  if (!key) return [];
 
   // 1. If explicit TMDB ID is provided:
   if (tmdbId && tmdbId.trim()) {
@@ -428,6 +432,7 @@ export async function getTmdbImages(
   const endpoint = type === "Series" ? "tv" : "movie";
   const url = `https://api.themoviedb.org/3/${endpoint}/${tmdbId}/images?api_key=${key}`;
   const list: Array<{ url: string; thumbnailUrl: string; width: number; height: number; type: "Primary" | "Backdrop"; communityRating: number; language?: string }> = [];
+  if (!key) return list;
 
   try {
     const res = await fetch(url, { headers: TMDB_HEADERS });

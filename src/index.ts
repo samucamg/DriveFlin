@@ -5,6 +5,25 @@ import { GoogleDrive } from "./gdrive";
 import { runSync } from "./sync";
 import { cleanMediaTitle, cleanEpisodeTitle, searchTmdb, getTmdbDetails, getTvSeasonEpisodes, searchTmdbRemote, getTmdbImages } from "./tmdb";
 import { createDatabaseBackup, listDatabaseBackups, restoreDatabaseBackup } from "./backup";
+import { withPersistedVars } from "./config";
+import {
+  extractAuth,
+  extractBasic,
+  lookupSession,
+  createSession,
+  deleteSession,
+  deleteUserSessions,
+  invalidateSessionCache,
+  ensureAuthSchema,
+  hashPassword,
+  verifyPassword,
+  parsePolicy,
+  randomHex,
+  tooManyFailures,
+  recordFailure,
+  clearFailures,
+  type SessionUser,
+} from "./auth";
 
 type Bindings = {
   RCLONE_PASS: string;
@@ -15,10 +34,17 @@ type Bindings = {
   GDRIVE_TEAM_DRIVE_ID: string;
   TMDB_API_KEY: string;
   GDRIVE_MEDIA_FOLDER_ID?: string;
+  ADMIN_PASSWORD?: string;
+  SERVER_ID?: string;
+  JELLYFIN_WEB_URL?: string;
+  BRANDING_LOGO_FILE_ID?: string;
+  PASSWORD_HASH_ITERATIONS?: string;
   DB: D1Database;
+  /** Guarda as variáveis de instalação para sobreviverem a redeploys (ver src/config.ts). */
+  DRIVEFLIN_CONFIG?: KVNamespace;
 };
 
-const app = new Hono<{ Bindings: Bindings }>();
+const app = new Hono<{ Bindings: Bindings; Variables: { auth: SessionUser | null } }>();
 
 // Ativar CORS para todos os apps web/mobile do Jellyfin
 app.use(
@@ -26,15 +52,24 @@ app.use(
   cors({
     origin: "*",
     allowHeaders: [
-      "X-Emby-Authorization",
-      "Content-Type",
       "Authorization",
+      "X-Emby-Authorization",
+      "X-Emby-Token",
+      "X-MediaBrowser-Token",
+      "X-Emby-Client",
+      "X-Emby-Client-Version",
+      "X-Emby-Device-Name",
+      "X-Emby-Device-Id",
+      "X-Emby-Language",
+      "Content-Type",
       "Accept",
+      "Accept-Language",
       "Range",
+      "If-Range",
       "Origin",
     ],
     allowMethods: ["POST", "GET", "OPTIONS", "HEAD", "DELETE", "PUT"],
-    exposeHeaders: ["Content-Range", "Content-Length", "Accept-Ranges"],
+    exposeHeaders: ["Content-Range", "Content-Length", "Accept-Ranges", "Content-Type"],
   }),
 );
 
@@ -43,7 +78,8 @@ app.use("*", async (c, next) => {
   const p = c.req.path;
   if (!p.startsWith("/web/") && !p.includes("socket") && !p.includes("SyncPlay")) {
     const ua = c.req.header("user-agent") || "";
-    console.log(`[REQ] ${c.req.method} ${c.req.url} | UA: ${ua.slice(0, 60)}`);
+    // Só o caminho: a query pode conter api_key/ApiKey (token de acesso).
+    console.log(`[REQ] ${c.req.method} ${p} | UA: ${ua.slice(0, 60)}`);
   }
   await next();
 });
@@ -59,7 +95,10 @@ function getImageTag(fileId: string | null | undefined): string | undefined {
 }
 
 
-const SERVER_ID = "639b4876bbb8b346ea020612bfe01ba8";
+// ServerId: instalações antigas mantêm o ID legado (os apps guardam o servidor por ele);
+// instalações novas recebem um ID aleatório, gravado na tabela Config (ver ensureSchema).
+const LEGACY_SERVER_ID = "639b4876bbb8b346ea020612bfe01ba8";
+let SERVER_ID = LEGACY_SERVER_ID;
 const DEFAULT_ADMIN_ID = "ee09da3140518fedd8b0f27b8b59bafb";
 const DEFAULT_SESSION_ID = "7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d";
 
@@ -171,15 +210,14 @@ async function ensureSchema(db: D1Database, env?: any) {
       )`),
       db.prepare(`CREATE TABLE IF NOT EXISTS Backups (
         Id TEXT PRIMARY KEY,
-        Timestamp TEXT NOT NULL,
-        Filename TEXT NOT NULL,
-        FileId TEXT,
+        Name TEXT,
+        DateCreated TEXT,
         Size INTEGER,
         Data TEXT
       )`),
-      db.prepare(`CREATE TABLE IF NOT EXISTS DebugLogs (
-        time TEXT,
-        log TEXT
+      db.prepare(`CREATE TABLE IF NOT EXISTS Config (
+        Key TEXT PRIMARY KEY,
+        Value TEXT
       )`),
       db.prepare(`CREATE TABLE IF NOT EXISTS UserItemData (
         UserId TEXT NOT NULL,
@@ -192,37 +230,55 @@ async function ensureSchema(db: D1Database, env?: any) {
       )`)
     ]);
 
-    try {
-      await db.prepare("ALTER TABLE Items ADD COLUMN Uuid TEXT").run();
-    } catch (e) {}
-    try {
-      await db.prepare("CREATE INDEX IF NOT EXISTS idx_items_uuid ON Items(Uuid)").run();
-    } catch (e) {}
-    try {
-      await db.prepare("ALTER TABLE Libraries ADD COLUMN Uuid TEXT").run();
-    } catch (e) {}
-    try {
-      await db.prepare("ALTER TABLE Libraries ADD COLUMN BackdropImageFileId TEXT").run();
-    } catch (e) {}
-    try {
-      await db.prepare("CREATE INDEX IF NOT EXISTS idx_libraries_uuid ON Libraries(Uuid)").run();
-    } catch (e) {}
+    const alters = [
+      "ALTER TABLE Items ADD COLUMN Uuid TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_items_uuid ON Items(Uuid)",
+      "ALTER TABLE Libraries ADD COLUMN Uuid TEXT",
+      "ALTER TABLE Libraries ADD COLUMN BackdropImageFileId TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_libraries_uuid ON Libraries(Uuid)",
+      "ALTER TABLE Users ADD COLUMN Policy TEXT",
+      "ALTER TABLE Users ADD COLUMN Configuration TEXT",
+      // v1 criava Backups com outras colunas; o módulo de backup usa Name/DateCreated.
+      "ALTER TABLE Backups ADD COLUMN Name TEXT",
+      "ALTER TABLE Backups ADD COLUMN DateCreated TEXT",
+    ];
+    for (const sql of alters) {
+      try { await db.prepare(sql).run(); } catch (e) {}
+    }
 
-    const defaultPassword = "admin";
-    const user = await db.prepare("SELECT Id, Password FROM Users WHERE Name = 'admin' OR Id = ? LIMIT 1").bind(DEFAULT_ADMIN_ID).first();
+    await ensureAuthSchema(db);
+
+    // ServerId por instalação
+    const configuredId = String(env?.SERVER_ID || "").replace(/-/g, "").toLowerCase();
+    if (/^[0-9a-f]{32}$/.test(configuredId)) {
+      SERVER_ID = configuredId;
+    } else {
+      const row: any = await db.prepare("SELECT Value FROM Config WHERE Key = 'ServerId'").first();
+      if (row && /^[0-9a-f]{32}$/.test(String(row.Value))) {
+        SERVER_ID = String(row.Value);
+      } else {
+        const existing: any = await db.prepare("SELECT COUNT(*) AS n FROM Users").first();
+        const id = (existing?.n || 0) > 0 ? LEGACY_SERVER_ID : randomHex(16);
+        await db.prepare("INSERT OR IGNORE INTO Config (Key, Value) VALUES ('ServerId', ?)").bind(id).run();
+        const saved: any = await db.prepare("SELECT Value FROM Config WHERE Key = 'ServerId'").first();
+        SERVER_ID = String(saved?.Value || id);
+      }
+    }
+
+    // Admin inicial: só é criado se ainda não existir, com senha padrão "admin"
+    // gravada com hash PBKDF2. Troque-a no primeiro acesso (Painel > Usuários).
+    const user: any = await db.prepare("SELECT Id, Password FROM Users WHERE Name = 'admin' OR Id = ? LIMIT 1").bind(DEFAULT_ADMIN_ID).first();
     if (!user) {
+      const hashed = await hashPassword("admin", parseInt(env?.PASSWORD_HASH_ITERATIONS || "", 10) || undefined);
       await db.prepare("INSERT INTO Users (Id, Name, Password) VALUES (?, ?, ?)")
-        .bind(DEFAULT_ADMIN_ID, "admin", defaultPassword)
+        .bind(DEFAULT_ADMIN_ID, "admin", hashed)
         .run();
-    } else if (!user.Password || user.Password === "Filmes@2026") {
-      await db.prepare("UPDATE Users SET Password = ? WHERE Id = ?")
-        .bind(defaultPassword, user.Id)
-        .run();
+      console.warn("[setup] Admin criado com a senha padrão 'admin'. Troque-a imediatamente.");
+    } else if (!user.Password) {
+      const hashed = await hashPassword("admin", parseInt(env?.PASSWORD_HASH_ITERATIONS || "", 10) || undefined);
+      await db.prepare("UPDATE Users SET Password = ? WHERE Id = ?").bind(hashed, user.Id).run();
     }
-    const confirmedAdmin = await db.prepare("SELECT Id FROM Users WHERE Name = 'admin' OR Id = ? LIMIT 1").bind(DEFAULT_ADMIN_ID).first();
-    if (confirmedAdmin) {
-      schemaReady = true;
-    }
+    schemaReady = true;
   } catch (e) {
     console.error("ensureSchema error:", e);
   }
@@ -232,6 +288,176 @@ app.use("*", async (c, next) => {
   if (c.env?.DB && !schemaReady) {
     await ensureSchema(c.env.DB, c.env);
   }
+  await next();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTENTICAÇÃO (v2)
+// Toda rota exige token, exceto as que o Jellyfin também serve sem login.
+// ─────────────────────────────────────────────────────────────────────────────
+type Access = "anon" | "user" | "admin" | "html-admin";
+
+const RESERVED_USER_SEGMENTS = new Set([
+  "public", "authenticatebyname", "authenticatewithquickconnect", "new", "forgotpassword", "password",
+]);
+
+export function classifyRoute(method: string, rawPath: string): Access {
+  const m = method.toUpperCase();
+  const p = (rawPath.toLowerCase().replace(/\/+$/, "") || "/");
+  const read = m === "GET" || m === "HEAD";
+
+  if (m === "OPTIONS") return "anon";
+  if (p === "/" || p === "/web" || p.startsWith("/web/")) return "anon";
+  if (read && (p === "/oauth" || p === "/token" || p === "/generator")) return "anon";
+  if (m === "POST" && p === "/api/oauth/exchange") return "anon";
+  if (p === "/system/ping") return "anon";
+  if (read && (
+    p === "/system/info/public" ||
+    p === "/users/public" ||
+    p === "/quickconnect/enabled" ||
+    p.startsWith("/branding/") ||
+    p.startsWith("/localization/") ||
+    p === "/favicon.ico" ||
+    p === "/robots.txt"
+  )) return "anon";
+  if (m === "POST" && p === "/users/authenticatebyname") return "anon";
+  // Imagens são públicas no Jellyfin (carregadas por <img> sem cabeçalho de auth).
+  if (read && /^\/(items|users|genres|persons|studios|artists|musicgenres)\/[^/]+(\/items\/[^/]+)?\/images\/[^/]+/.test(p)) return "anon";
+  // Legendas (o player as carrega por <track> sem cabeçalho).
+  if (read && /^\/videos\/[^/]+\/[^/]+\/subtitles\/\d+\/(\d+\/)?stream\.[a-z0-9]+$/.test(p)) return "anon";
+
+  if (p === "/setup" || p.startsWith("/setup/") || p === "/sync" || p === "/fix-uuid") return "html-admin";
+
+  if (/^\/(backup|environment|scheduledtasks|system\/logs|system\/activitylog|library\/refresh|items\/root\/refresh|items\/remotesearch|users\/new)(\/|$)/.test(p)) return "admin";
+  if (!read && /^\/(system\/configuration|branding\/configuration|library\/virtualfolders|devices)(\/|$)/.test(p)) return "admin";
+  if (/^\/items\/[^/]+\/remoteimages(\/|$)/.test(p)) return "admin";
+  if (!read && /^\/items\/[^/]+\/(images|refresh)(\/|$)/.test(p)) return "admin";
+  if (!read && /^\/users\/[^/]+\/policy$/.test(p)) return "admin";
+  if (m === "DELETE" && /^\/users\/[^/]+$/.test(p)) return "admin";
+  if (m === "POST" && p === "/users") return "admin";
+  return "user";
+}
+
+function normalizeId(id: string): string {
+  return String(id || "").trim().replace(/-/g, "").toLowerCase();
+}
+
+function isSameUser(id: string, s: SessionUser): boolean {
+  const n = normalizeId(id);
+  return n === s.userUuid || id === s.userId || toValidUuid(id) === s.userUuid;
+}
+
+function isSameOriginRequest(c: any): boolean {
+  const host = new URL(c.req.url).host;
+  const origin = c.req.header("Origin");
+  if (origin) {
+    try { return new URL(origin).host === host; } catch (e) { return false; }
+  }
+  const ref = c.req.header("Referer");
+  if (ref) {
+    try { return new URL(ref).host === host; } catch (e) { return false; }
+  }
+  return false;
+}
+
+function clientIp(c: any): string {
+  return c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
+}
+
+/** Usuário da sessão atual (sempre presente nas rotas autenticadas). */
+export function currentAuth(c: any): SessionUser | null {
+  try { return c.get("auth") || null; } catch (e) { return null; }
+}
+
+/** Id (32 hex) do usuário logado — substitui o antigo "sempre admin". */
+function currentUserId(c: any): string {
+  return currentAuth(c)?.userUuid || DEFAULT_ADMIN_ID;
+}
+
+function currentToken(c: any): string {
+  return currentAuth(c)?.token || "";
+}
+
+async function loginWithBasic(c: any, user: string, pass: string): Promise<SessionUser | null> {
+  const db = c.env.DB;
+  const ip = clientIp(c);
+  if (await tooManyFailures(db, ip, user)) return null;
+  const row: any = await db.prepare("SELECT * FROM Users WHERE LOWER(Name) = LOWER(?)").bind(user).first();
+  const result = row ? await verifyPassword(row.Password, pass) : { ok: false, needsRehash: false };
+  const policy = row ? parsePolicy(row, defaultPolicy) : null;
+  if (!row || !result.ok || !policy || policy.IsDisabled) {
+    await recordFailure(db, ip, user);
+    return null;
+  }
+  return {
+    token: "",
+    userId: row.Id,
+    userUuid: toValidUuid(row.Id),
+    name: row.Name,
+    isAdmin: !!policy.IsAdministrator,
+    deviceId: "",
+    deviceName: "browser",
+    client: "setup",
+    version: "",
+  };
+}
+
+app.use("*", async (c, next) => {
+  const access = classifyRoute(c.req.method, c.req.path);
+  if (access === "anon") {
+    c.set("auth", null);
+    return next();
+  }
+
+  const db = c.env.DB;
+  let session: SessionUser | null = null;
+  const info = extractAuth(c.req.raw);
+  if (info.token) {
+    session = await lookupSession(db, info.token, defaultPolicy, toValidUuid);
+  }
+  let viaBasic = false;
+  if (!session && access === "html-admin") {
+    const basic = extractBasic(c.req.raw);
+    if (basic) {
+      session = await loginWithBasic(c, basic.user, basic.pass);
+      viaBasic = !!session;
+    }
+  }
+
+  if (!session) {
+    if (access === "html-admin") {
+      return new Response("Login de administrador necessário.", {
+        status: 401,
+        headers: { "WWW-Authenticate": 'Basic realm="DriveFlin", charset="UTF-8"', "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  if ((access === "admin" || access === "html-admin") && !session.isAdmin) {
+    return c.json({ error: "Forbidden" }, 403);
+  }
+
+  // Páginas HTML com Basic: bloqueia POST vindo de outro site (CSRF).
+  if (viaBasic && !["GET", "HEAD"].includes(c.req.method.toUpperCase()) && !isSameOriginRequest(c)) {
+    return c.json({ error: "Forbidden" }, 403);
+  }
+
+  // Usuário comum só acessa os próprios dados.
+  if (!session.isAdmin) {
+    const m = c.req.path.match(/^\/users\/([^/]+)/i);
+    if (m && !RESERVED_USER_SEGMENTS.has(m[1].toLowerCase()) && !isSameUser(m[1], session)) {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+    const url = new URL(c.req.url);
+    for (const [k, v] of url.searchParams) {
+      if (k.toLowerCase() === "userid" && v && !isSameUser(v, session)) {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+    }
+  }
+
+  c.set("auth", session);
   await next();
 });
 
@@ -290,51 +516,39 @@ app.post("/api/oauth/exchange", async (c) => {
 app.get("/", (c) => c.redirect("/web/index.html"));
 
 
-app.post("/debug_log", async (c) => {
-  const body = await c.req.text();
-  await c.env.DB.prepare(
-    "CREATE TABLE IF NOT EXISTS DebugLogs (time TEXT, log TEXT)",
-  ).run();
-  await c.env.DB.prepare(
-    "INSERT INTO DebugLogs (time, log) VALUES (datetime('now'), ?)",
-  )
-    .bind(body)
-    .run();
-  return c.text("ok");
-});
-
-app.get("/debug_logs", async (c) => {
-  try {
-    const { results } = await c.env.DB.prepare(
-      "SELECT * FROM DebugLogs ORDER BY time DESC LIMIT 50",
-    ).all();
-    return c.json(results);
-  } catch (e: any) {
-    return c.json({ error: e.toString() });
-  }
-});
-
 app.get("/web/ConfigurationPages", (c) => c.json([]));
 app.get("/ConfigurationPages", (c) => c.json([]));
 
+async function fixUuids(db: D1Database, onlyMissing = false) {
+  const where = onlyMissing ? " WHERE Uuid IS NULL OR Uuid = ''" : "";
+  const items = await db.prepare("SELECT Id FROM Items" + where).all();
+  const libs = await db.prepare("SELECT Id FROM Libraries" + where).all();
+  const stmts = [
+    ...((items.results || []) as any[]).map((it) => db.prepare("UPDATE Items SET Uuid = ? WHERE Id = ?").bind(toValidUuid(String(it.Id)), it.Id)),
+    ...((libs.results || []) as any[]).map((lib) => db.prepare("UPDATE Libraries SET Uuid = ? WHERE Id = ?").bind(toValidUuid(String(lib.Id)), lib.Id)),
+  ];
+  for (let i = 0; i < stmts.length; i += 100) await db.batch(stmts.slice(i, i + 100));
+}
+
 app.get("/fix-uuid", async (c) => {
-  const items = await c.env.DB.prepare("SELECT Id FROM Items").all<{ Id: string }>();
-  for (const item of items.results) {
-    await c.env.DB.prepare("UPDATE Items SET Uuid = ? WHERE Id = ?").bind(toValidUuid(item.Id), item.Id).run();
-  }
-  const libs = await c.env.DB.prepare("SELECT Id FROM Libraries").all<{ Id: string }>();
-  for (const lib of libs.results) {
-    await c.env.DB.prepare("UPDATE Libraries SET Uuid = ? WHERE Id = ?").bind(toValidUuid(lib.Id), lib.Id).run();
-  }
+  await fixUuids(c.env.DB);
   return c.text("Fixed UUIDs");
 });
 
+// Interface web do Jellyfin. Por padrão vem de demo.jellyfin.org/stable; defina
+// JELLYFIN_WEB_URL para usar outra cópia (ex.: uma build fixada do jellyfin-web).
+const WEB_FORWARD_HEADERS = ["accept", "accept-language", "if-none-match", "if-modified-since", "range", "user-agent"];
 app.get("/web/*", async (c) => {
   const url = new URL(c.req.url);
-  const targetUrl = `https://demo.jellyfin.org/stable${url.pathname}${url.search}`;
+  const base = String(c.env.JELLYFIN_WEB_URL || "https://demo.jellyfin.org/stable").replace(/\/+$/, "");
+  const targetUrl = `${base}${url.pathname}${url.search}`;
 
-  const newHeaders = new Headers(c.req.header());
-  newHeaders.delete("accept-encoding");
+  // Repassa só cabeçalhos inofensivos: nunca tokens, cookies ou Authorization.
+  const newHeaders = new Headers();
+  for (const h of WEB_FORWARD_HEADERS) {
+    const v = c.req.header(h);
+    if (v) newHeaders.set(h, v);
+  }
   const response = await fetch(targetUrl, {
     headers: newHeaders,
   });
@@ -353,20 +567,28 @@ app.get("/web/*", async (c) => {
 
   const proxyResponse = new Response(response.body, response);
   proxyResponse.headers.set("Access-Control-Allow-Origin", "*");
+  proxyResponse.headers.delete("set-cookie");
   return proxyResponse;
 });
 
-// Rota para disparar o Sync manualmente
-app.get("/sync", async (c) => {
+// Rota para disparar o Sync manualmente (somente administrador)
+const handleManualSync = async (c: any) => {
   try {
     await runSync(c.env);
     return c.json({ message: "Sync completed successfully" });
   } catch (e: any) {
-    return c.json({ error: e.message }, 500);
+    console.error("[sync] erro:", e);
+    return c.json({ error: "Sync failed" }, 500);
   }
-});
+};
+app.get("/sync", handleManualSync);
+app.post("/sync", handleManualSync);
 
-// Dashboard de Setup Simples
+function escapeHtml(v: any): string {
+  return String(v ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch] as string));
+}
+
+// Dashboard de Setup Simples (login de administrador via HTTP Basic)
 app.get("/setup", async (c) => {
   const { results } = await c.env.DB.prepare("SELECT * FROM Libraries").all();
   let html = `<html><head><title>DriveFlin Setup</title><style>body{font-family:sans-serif;padding:20px;background:#141414;color:#fff;}table{width:100%;border-collapse:collapse;margin-bottom:20px;}th,td{border:1px solid #333;padding:10px;text-align:left;}input{padding:5px;}button{padding:8px 15px;background:#e50914;color:white;border:none;cursor:pointer;}</style></head><body>
@@ -377,8 +599,8 @@ app.get("/setup", async (c) => {
   results.forEach((lib: any) => {
     html += `<tr>
       <form method="POST" action="/setup/delete">
-      <td>${lib.Id}</td><td>${lib.Name}</td><td>${lib.FolderId}</td>
-      <td><input type="hidden" name="id" value="${lib.Id}"/><button type="submit">Delete</button></td>
+      <td>${escapeHtml(lib.Id)}</td><td>${escapeHtml(lib.Name)}</td><td>${escapeHtml(lib.FolderId)}</td>
+      <td><input type="hidden" name="id" value="${escapeHtml(lib.Id)}"/><button type="submit">Delete</button></td>
       </form></tr>`;
   });
 
@@ -391,14 +613,17 @@ app.get("/setup", async (c) => {
       <button type="submit">Add Library</button>
     </form>
     <br/><br/>
-    <form method="GET" action="/sync"><button type="submit">Run Sync Now</button></form>
+    <form method="POST" action="/sync"><button type="submit">Run Sync Now</button></form>
     </body></html>`;
   return c.html(html);
 });
 
 app.post("/setup/add", async (c) => {
   const body = await c.req.parseBody();
-  const libId = body.id as string;
+  const libId = String(body.id || "").trim();
+  if (!/^[A-Za-z0-9_.-]{1,80}$/.test(libId) || !body.name || !body.folderId) {
+    return c.text("Dados inválidos", 400);
+  }
   await c.env.DB.prepare(
     "INSERT INTO Libraries (Id, Name, FolderId, Uuid) VALUES (?, ?, ?, ?)",
   )
@@ -498,8 +723,8 @@ app.get("/socket/*", (c) => {
 // Web UI Requirements & Administration
 const defaultBrandingConfig = {
   LoginDisclaimer: "",
-  CustomCss: `@import url('https://cdn.jsdelivr.net/gh/prayag17/JellyFlix@latest/default.css');
-@import url('https://cdn.jsdelivr.net/gh/prayag17/JellyFlix@latest/addons/Logo.css');
+  CustomCss: `@import url('https://cdn.jsdelivr.net/gh/prayag17/JellyFlix@27be594f693204fc6f025502165c7a09a0dfa28e/default.css');
+@import url('https://cdn.jsdelivr.net/gh/prayag17/JellyFlix@27be594f693204fc6f025502165c7a09a0dfa28e/addons/Logo.css');
 
 :root {
   --accent: #E50914 !important;
@@ -950,104 +1175,105 @@ const defaultPolicy = {
   SyncPlayAccess: "CreateAndJoinGroups",
 };
 
-app.get("/users/public", async (c) => {
-  try {
-    const { results } = await c.env.DB.prepare("SELECT Id, Name FROM Users").all();
-    return c.json(
-      results.map((u: any) => ({
-        Name: u.Name,
-        Id: toValidUuid(u.Id),
-        ServerId: SERVER_ID,
-        HasPassword: true,
-        HasConfiguredPassword: true,
-      }))
-    );
-  } catch (e) {
-    return c.json([
-      {
-        Name: "admin",
-        Id: DEFAULT_ADMIN_ID,
-        ServerId: SERVER_ID,
-        HasPassword: true,
-        HasConfiguredPassword: true,
-      },
-    ]);
+// ─────────────────────────────────────────────────────────────────────────────
+// USUÁRIOS (v2): senhas com hash PBKDF2, políticas reais e sessões por token.
+// ─────────────────────────────────────────────────────────────────────────────
+function userConfigOf(u: any): any {
+  let config = defaultUserConfig;
+  try { if (u?.Configuration) config = { ...defaultUserConfig, ...JSON.parse(u.Configuration) }; } catch (e) {}
+  return config;
+}
+
+function userDto(u: any, extra: any = {}): any {
+  return {
+    Name: u.Name,
+    ServerId: SERVER_ID,
+    Id: toValidUuid(u.Id),
+    HasPassword: !!u.Password,
+    HasConfiguredPassword: !!u.Password,
+    HasConfiguredEasyPassword: false,
+    EnableAutoLogin: false,
+    Configuration: userConfigOf(u),
+    Policy: parsePolicy(u, defaultPolicy),
+    ...extra,
+  };
+}
+
+async function findUserByAnyId(db: D1Database, rawId: string): Promise<any> {
+  if (!rawId) return null;
+  const norm = toValidUuid(rawId);
+  let user: any = await db.prepare("SELECT * FROM Users WHERE Id = ? OR Id = ?").bind(rawId, norm).first();
+  if (user) return user;
+  // Ids antigos não-hex: compara pela forma normalizada.
+  const { results } = await db.prepare("SELECT * FROM Users").all();
+  for (const u of (results || []) as any[]) {
+    if (toValidUuid(u.Id) === norm) return u;
   }
-});
-app.get("/Users/Public", async (c) => c.redirect("/users/public", 307));
+  return null;
+}
 
-// 2. Authentication and User Management
-app.get("/Users", async (c) => {
+function hashIterations(c: any): number | undefined {
+  return parseInt(c.env?.PASSWORD_HASH_ITERATIONS || "", 10) || undefined;
+}
+
+const handlePublicUsers = async (c: any) => {
   try {
-    try { await c.env.DB.prepare("ALTER TABLE Users ADD COLUMN Policy TEXT").run(); } catch (e) {}
-    try { await c.env.DB.prepare("ALTER TABLE Users ADD COLUMN Configuration TEXT").run(); } catch (e) {}
-
     const { results } = await c.env.DB.prepare("SELECT * FROM Users").all();
     return c.json(
-      results.map((u: any) => {
-        let policy = defaultPolicy;
-        try { if (u.Policy) policy = { ...defaultPolicy, ...JSON.parse(u.Policy) }; } catch (e) {}
-        let config = defaultUserConfig;
-        try { if (u.Configuration) config = { ...defaultUserConfig, ...JSON.parse(u.Configuration) }; } catch (e) {}
-        return {
+      (results || [])
+        .filter((u: any) => {
+          const p = parsePolicy(u, defaultPolicy);
+          return !p.IsHidden && !p.IsDisabled;
+        })
+        .map((u: any) => ({
           Name: u.Name,
           Id: toValidUuid(u.Id),
           ServerId: SERVER_ID,
-          HasPassword: true,
-          HasConfiguredPassword: true,
-          Policy: policy,
-          Configuration: config,
-        };
-      })
+          HasPassword: !!u.Password,
+          HasConfiguredPassword: !!u.Password,
+        }))
     );
   } catch (e) {
-    return c.json([
-      {
-        Name: "admin",
-        Id: DEFAULT_ADMIN_ID,
-        ServerId: SERVER_ID,
-        HasPassword: true,
-        HasConfiguredPassword: true,
-        Policy: defaultPolicy,
-        Configuration: defaultUserConfig,
-      },
-    ]);
+    return c.json([]);
   }
+};
+app.get("/users/public", handlePublicUsers);
+app.get("/Users/Public", handlePublicUsers);
+
+app.get("/Users", async (c) => {
+  const auth = currentAuth(c);
+  const { results } = auth?.isAdmin
+    ? await c.env.DB.prepare("SELECT * FROM Users").all()
+    : await c.env.DB.prepare("SELECT * FROM Users WHERE Id = ?").bind(auth?.userId || "").all();
+  return c.json((results || []).map((u: any) => userDto(u)));
 });
 app.get("/users", async (c) => c.redirect("/Users", 307));
 
-app.post("/Users/New", async (c) => {
+const handleNewUser = async (c: any) => {
   let body: any = {};
   try { body = await c.req.json(); } catch (e) {}
-  const name = body.Name || "Novo Usuario";
-  const password = body.Password || "";
+  const name = String(body.Name || "").trim();
+  if (!name) return c.json({ error: "Name is required" }, 400);
+  const exists: any = await c.env.DB.prepare("SELECT Id FROM Users WHERE LOWER(Name) = LOWER(?)").bind(name).first();
+  if (exists) return c.json({ error: "A user with that name already exists" }, 400);
+
+  const password = String(body.Password || "");
   const id = crypto.randomUUID().replace(/-/g, "").toLowerCase();
-
-  try { await c.env.DB.prepare("ALTER TABLE Users ADD COLUMN Policy TEXT").run(); } catch (e) {}
-  try { await c.env.DB.prepare("ALTER TABLE Users ADD COLUMN Configuration TEXT").run(); } catch (e) {}
-
   const userPolicy = {
     ...defaultPolicy,
     IsAdministrator: false,
     EnableAllFolders: true,
     EnabledFolders: [],
   };
-
+  const hashed = await hashPassword(password, hashIterations(c));
   await c.env.DB.prepare(
     "INSERT INTO Users (Id, Name, Password, Policy, Configuration) VALUES (?, ?, ?, ?, ?)"
-  ).bind(id, name, password, JSON.stringify(userPolicy), JSON.stringify(defaultUserConfig)).run();
+  ).bind(id, name, hashed, JSON.stringify(userPolicy), JSON.stringify(defaultUserConfig)).run();
 
-  return c.json({
-    Name: name,
-    Id: id,
-    ServerId: SERVER_ID,
-    HasPassword: !!password,
-    HasConfiguredPassword: !!password,
-    Policy: userPolicy,
-    Configuration: defaultUserConfig,
-  });
-});
-app.post("/users/new", async (c) => c.redirect("/Users/New", 307));
+  return c.json(userDto({ Id: id, Name: name, Password: hashed, Policy: JSON.stringify(userPolicy) }));
+};
+app.post("/Users/New", handleNewUser);
+app.post("/users/new", handleNewUser);
 
 app.post("/Users/AuthenticateByName", handleAuth);
 app.post("/Users/authenticatebyname", handleAuth);
@@ -1063,67 +1289,44 @@ async function handleAuth(c: any) {
       body = await c.req.parseBody();
     } catch (e2) {}
   }
-  const Username = body.Username || body.username || c.req.query("Username") || c.req.query("username") || "admin";
-  const Pw = body.Pw || body.pw || body.Password || body.password || "";
+  const db = c.env.DB;
+  const username = String(body.Username ?? body.username ?? "").trim();
+  const pw = String(body.Pw ?? body.pw ?? body.Password ?? body.password ?? "");
+  const ip = clientIp(c);
 
-  let user: any = null;
-  try {
-    const { results } = await c.env.DB.prepare(
-      "SELECT * FROM Users WHERE LOWER(Name) = LOWER(?)"
-    )
-      .bind(Username)
-      .all();
-    if (results && results.length) {
-      user = results[0];
-    }
-  } catch (e) {}
-
-  if (!user && (Username.toLowerCase() === "admin" || !Username)) {
-    try {
-      await ensureSchema(c.env.DB, c.env);
-      user = await c.env.DB.prepare("SELECT * FROM Users WHERE Name = 'admin' OR Id = ? LIMIT 1").bind(DEFAULT_ADMIN_ID).first();
-      if (!user) {
-        await c.env.DB.prepare("INSERT INTO Users (Id, Name, Password) VALUES (?, ?, ?)")
-          .bind(DEFAULT_ADMIN_ID, "admin", "admin")
-          .run();
-        user = { Id: DEFAULT_ADMIN_ID, Name: "admin", Password: "admin" };
-      }
-    } catch (e) {}
+  if (await tooManyFailures(db, ip, username)) {
+    return c.json({ error: "Too many failed login attempts. Try again later." }, 429);
   }
 
-  if (!user) {
-    return c.json({ error: "Invalid username" }, 401);
+  let user: any = username
+    ? await db.prepare("SELECT * FROM Users WHERE LOWER(Name) = LOWER(?)").bind(username).first()
+    : null;
+  if (!user && username.toLowerCase() === "admin") {
+    await ensureSchema(db, c.env);
+    user = await db.prepare("SELECT * FROM Users WHERE LOWER(Name) = LOWER(?)").bind(username).first();
   }
-  if (user.Password && Pw && user.Password !== Pw) {
-    return c.json({ error: "Invalid password" }, 401);
+  const policy = user ? parsePolicy(user, defaultPolicy) : null;
+  const check = user ? await verifyPassword(user.Password, pw) : { ok: false, needsRehash: false };
+
+  if (!user || !policy || !check.ok || policy.IsDisabled) {
+    await recordFailure(db, ip, username);
+    return c.json({ error: "Invalid username or password" }, 401);
   }
 
+  if (check.needsRehash) {
+    const hashed = await hashPassword(pw, hashIterations(c));
+    await db.prepare("UPDATE Users SET Password = ? WHERE Id = ?").bind(hashed, user.Id).run();
+    user.Password = hashed;
+  }
+  await clearFailures(db, ip, username);
+
+  const info = extractAuth(c.req.raw);
+  const token = await createSession(db, user.Id, info);
   const userId = toValidUuid(user.Id);
-
-  let policy = defaultPolicy;
-  try { if (user.Policy) policy = { ...defaultPolicy, ...JSON.parse(user.Policy) }; } catch (e) {}
-  let config = defaultUserConfig;
-  try { if (user.Configuration) config = { ...defaultUserConfig, ...JSON.parse(user.Configuration) }; } catch (e) {}
-
-  const clientName = c.req.header("X-Emby-Client") || "Jellyfin Client";
-  const deviceName = c.req.header("X-Emby-Device-Name") || "Device";
-  const deviceId = c.req.header("X-Emby-Device-Id") || "device_123";
-  const clientVersion = c.req.header("X-Emby-Client-Version") || "12.0.0";
+  const now = new Date().toISOString();
 
   return c.json({
-    User: {
-      Name: user.Name,
-      ServerId: SERVER_ID,
-      Id: userId,
-      HasPassword: true,
-      HasConfiguredPassword: true,
-      HasConfiguredEasyPassword: false,
-      EnableAutoLogin: false,
-      LastLoginDate: new Date().toISOString(),
-      LastActivityDate: new Date().toISOString(),
-      Configuration: config,
-      Policy: policy,
-    },
+    User: userDto(user, { LastLoginDate: now, LastActivityDate: now }),
     SessionInfo: {
       PlayState: {
         CanSeek: true,
@@ -1138,53 +1341,31 @@ async function handleAuth(c: any) {
         SupportsMediaControl: true,
         SupportsPersistentIdentifier: true,
       },
-      RemoteEndPoint: "127.0.0.1",
+      RemoteEndPoint: ip,
       PlayableMediaTypes: ["Audio", "Video"],
-      Id: DEFAULT_SESSION_ID,
+      Id: toValidUuid("session_" + token),
       UserId: userId,
       UserName: user.Name,
-      Client: clientName,
-      LastActivityDate: new Date().toISOString(),
-      DeviceName: deviceName,
-      DeviceId: deviceId,
-      ApplicationVersion: clientVersion,
+      Client: info.client || "Jellyfin Client",
+      LastActivityDate: now,
+      DeviceName: info.device || "Device",
+      DeviceId: info.deviceId || "",
+      ApplicationVersion: info.version || "",
       IsActive: true,
       SupportsMediaControl: true,
       ServerId: SERVER_ID,
     },
-    AccessToken: "fake_jwt_token_12345",
+    AccessToken: token,
     ServerId: SERVER_ID,
   });
 }
 
 const handleCurrentUser = async (c: any) => {
-  let user: any = null;
-  try {
-    user = await c.env.DB.prepare("SELECT * FROM Users WHERE Id = ? OR Name = 'admin' LIMIT 1").bind(DEFAULT_ADMIN_ID).first();
-  } catch (e) {}
-
-  let policy = defaultPolicy;
-  let config = defaultUserConfig;
-  let name = user?.Name || "admin";
-  let id = user?.Id ? toValidUuid(user.Id) : DEFAULT_ADMIN_ID;
-
-  if (user) {
-    try { if (user.Policy) policy = { ...defaultPolicy, ...JSON.parse(user.Policy) }; } catch (e) {}
-    try { if (user.Configuration) config = { ...defaultUserConfig, ...JSON.parse(user.Configuration) }; } catch (e) {}
-  }
-
-  return c.json({
-    Name: name,
-    Id: id,
-    ServerId: SERVER_ID,
-    ServerName: "DriveFlin",
-    HasPassword: true,
-    HasConfiguredPassword: true,
-    HasConfiguredEasyPassword: false,
-    EnableAutoLogin: true,
-    Configuration: config,
-    Policy: policy,
-  });
+  const auth = currentAuth(c);
+  if (!auth) return c.json({ error: "Unauthorized" }, 401);
+  const user: any = await c.env.DB.prepare("SELECT * FROM Users WHERE Id = ?").bind(auth.userId).first();
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  return c.json(userDto(user, { ServerName: "DriveFlin" }));
 };
 
 app.get("/Users/Me", handleCurrentUser);
@@ -1197,205 +1378,126 @@ const handleGetUserById = async (c: any) => {
   if (!rawId || rawId.toLowerCase() === "me") {
     return handleCurrentUser(c);
   }
-
-  const validId = toValidUuid(rawId);
-  let user: any = null;
-  try {
-    user = await c.env.DB.prepare("SELECT * FROM Users WHERE Id = ? OR Id = ?").bind(rawId, validId).first();
-  } catch (e) {}
-
-  if (!user && (rawId === DEFAULT_ADMIN_ID || rawId === DEFAULT_ADMIN_ID || rawId.toLowerCase() === "admin")) {
-    try {
-      user = await c.env.DB.prepare("SELECT * FROM Users WHERE Name = 'admin' LIMIT 1").first();
-    } catch (e) {}
-  }
-
-  let policy = defaultPolicy;
-  let config = defaultUserConfig;
-  let name = user?.Name || "admin";
-  const id = user?.Id ? toValidUuid(user.Id) : validId;
-
-  if (user) {
-    try { if (user.Policy) policy = { ...defaultPolicy, ...JSON.parse(user.Policy) }; } catch (e) {}
-    try { if (user.Configuration) config = { ...defaultUserConfig, ...JSON.parse(user.Configuration) }; } catch (e) {}
-  }
-
-  return c.json({
-    Name: name,
-    Id: id,
-    ServerId: SERVER_ID,
-    HasPassword: true,
-    HasConfiguredPassword: true,
-    Configuration: config,
-    Policy: policy,
-  });
+  const user = await findUserByAnyId(c.env.DB, rawId);
+  if (!user) return c.json({ error: "User not found" }, 404);
+  return c.json(userDto(user));
 };
 
-
-app.post("/Users/:userId", async (c) => {
+// Atualização do usuário (nome). O próprio usuário ou um admin (checado no middleware).
+const handleUpdateUser = async (c: any, rawId: string) => {
   try {
-    const rawId = c.req.param("userId");
-    const userId = toValidUuid(rawId);
-    const body = await c.req.json();
-    
-    await c.env.DB.prepare("UPDATE Users SET Name = ? WHERE Id = ? OR Id = ?")
-      .bind(body.Name, rawId, userId)
-      .run();
-    
+    const user = await findUserByAnyId(c.env.DB, rawId);
+    if (!user) return c.json({ error: "User not found" }, 404);
+    const body = await c.req.json().catch(() => ({}));
+    const name = String(body.Name || "").trim();
+    if (name && name !== user.Name) {
+      const clash: any = await c.env.DB.prepare("SELECT Id FROM Users WHERE LOWER(Name) = LOWER(?) AND Id <> ?").bind(name, user.Id).first();
+      if (clash) return c.json({ error: "A user with that name already exists" }, 400);
+      await c.env.DB.prepare("UPDATE Users SET Name = ? WHERE Id = ?").bind(name, user.Id).run();
+      invalidateSessionCache((s) => s.userId === user.Id);
+    }
     return c.body(null, 204);
   } catch (e) {
     console.error(e);
     return c.body(null, 500);
   }
-});
-app.post("/users/:userId", async (c) => {
-  try {
-    const rawId = c.req.param("userId");
-    const userId = toValidUuid(rawId);
-    const body = await c.req.json();
-    
-    await c.env.DB.prepare("UPDATE Users SET Name = ? WHERE Id = ? OR Id = ?")
-      .bind(body.Name, rawId, userId)
-      .run();
-    
-    return c.body(null, 204);
-  } catch (e) {
-    console.error(e);
-    return c.body(null, 500);
-  }
-});
-
-
-app.post("/Users", async (c) => {
-  try {
-    const userId = c.req.query("userId");
-    const validId = toValidUuid(userId);
-    const body = await c.req.json();
-    
-    await c.env.DB.prepare("UPDATE Users SET Name = ? WHERE Id = ? OR Id = ?")
-      .bind(body.Name, userId, validId)
-      .run();
-    
-    return c.body(null, 204);
-  } catch (e) {
-    console.error(e);
-    return c.body(null, 500);
-  }
-});
-
-app.post("/Users/:userId", async (c) => {
-  try {
-    const rawId = c.req.param("userId");
-    const userId = toValidUuid(rawId);
-    const body = await c.req.json();
-    
-    await c.env.DB.prepare("UPDATE Users SET Name = ? WHERE Id = ? OR Id = ?")
-      .bind(body.Name, rawId, userId)
-      .run();
-    
-    return c.body(null, 204);
-  } catch (e) {
-    console.error(e);
-    return c.body(null, 500);
-  }
-});
-app.post("/users/:userId", async (c) => {
-  try {
-    const rawId = c.req.param("userId");
-    const userId = toValidUuid(rawId);
-    const body = await c.req.json();
-    
-    await c.env.DB.prepare("UPDATE Users SET Name = ? WHERE Id = ? OR Id = ?")
-      .bind(body.Name, rawId, userId)
-      .run();
-    
-    return c.body(null, 204);
-  } catch (e) {
-    console.error(e);
-    return c.body(null, 500);
-  }
-});
+};
+// Jellyfin 10.9+: POST /Users/Password?userId=... (precisa vir antes de /Users/:userId)
+const handlePasswordByQuery = (c: any) =>
+  handleChangePassword(c, c.req.query("userId") || c.req.query("UserId") || currentUserId(c));
+app.post("/Users/Password", handlePasswordByQuery);
+app.post("/users/password", handlePasswordByQuery);
+app.post("/Users/:userId", (c) => handleUpdateUser(c, c.req.param("userId")));
+app.post("/users/:userId", (c) => handleUpdateUser(c, c.req.param("userId")));
+app.post("/Users", (c) => handleUpdateUser(c, c.req.query("userId") || c.req.query("UserId") || ""));
 
 app.get("/Users/:userId", handleGetUserById);
 app.get("/users/:userId", handleGetUserById);
 
-app.post("/Users/:userId/Policy", async (c) => {
-  const rawId = c.req.param("userId");
-  const userId = toValidUuid(rawId);
-  const body = await c.req.json().catch(() => ({}));
-  try {
-    await c.env.DB.prepare("UPDATE Users SET Policy = ? WHERE Id = ? OR Id = ?").bind(JSON.stringify(body), rawId, userId).run();
-  } catch (e) {}
+const handleUpdatePolicy = async (c: any) => {
+  const user = await findUserByAnyId(c.env.DB, c.req.param("userId"));
+  if (!user) return c.json({ error: "User not found" }, 404);
+  const body: any = await c.req.json().catch(() => ({}));
+  if (!body || typeof body !== "object") return c.json({ error: "Invalid policy" }, 400);
+  const auth = currentAuth(c);
+  // Não deixa o admin remover o próprio acesso de administrador nem se desativar.
+  if (auth && auth.userId === user.Id) {
+    body.IsAdministrator = true;
+    body.IsDisabled = false;
+  }
+  await c.env.DB.prepare("UPDATE Users SET Policy = ? WHERE Id = ?").bind(JSON.stringify(body), user.Id).run();
+  invalidateSessionCache((s) => s.userId === user.Id);
+  if (body.IsDisabled) await deleteUserSessions(c.env.DB, user.Id);
   return c.body(null, 204);
-});
-app.post("/users/:userId/policy", async (c) => {
-  const rawId = c.req.param("userId");
-  const userId = toValidUuid(rawId);
-  const body = await c.req.json().catch(() => ({}));
-  try {
-    await c.env.DB.prepare("UPDATE Users SET Policy = ? WHERE Id = ? OR Id = ?").bind(JSON.stringify(body), rawId, userId).run();
-  } catch (e) {}
-  return c.body(null, 204);
-});
+};
+app.post("/Users/:userId/Policy", handleUpdatePolicy);
+app.post("/users/:userId/policy", handleUpdatePolicy);
 
-app.post("/Users/:userId/Configuration", async (c) => {
-  const rawId = c.req.param("userId");
-  const userId = toValidUuid(rawId);
+const handleUpdateUserConfig = async (c: any) => {
+  const user = await findUserByAnyId(c.env.DB, c.req.param("userId"));
+  if (!user) return c.json({ error: "User not found" }, 404);
   const body = await c.req.json().catch(() => ({}));
-  try {
-    await c.env.DB.prepare("UPDATE Users SET Configuration = ? WHERE Id = ? OR Id = ?").bind(JSON.stringify(body), rawId, userId).run();
-  } catch (e) {}
+  await c.env.DB.prepare("UPDATE Users SET Configuration = ? WHERE Id = ?").bind(JSON.stringify(body), user.Id).run();
   return c.body(null, 204);
-});
-app.post("/users/:userId/configuration", async (c) => {
-  const rawId = c.req.param("userId");
-  const userId = toValidUuid(rawId);
-  const body = await c.req.json().catch(() => ({}));
-  try {
-    await c.env.DB.prepare("UPDATE Users SET Configuration = ? WHERE Id = ? OR Id = ?").bind(JSON.stringify(body), rawId, userId).run();
-  } catch (e) {}
-  return c.body(null, 204);
-});
+};
+app.post("/Users/:userId/Configuration", handleUpdateUserConfig);
+app.post("/users/:userId/configuration", handleUpdateUserConfig);
 
-app.post("/Users/:userId/Password", async (c) => {
-  const rawId = c.req.param("userId");
-  const userId = toValidUuid(rawId);
-  let body: any = {};
-  try { body = await c.req.json(); } catch (e) {}
-  const newPw = body.NewPw || body.NewPassword || "";
-  if (newPw) {
-    await c.env.DB.prepare("UPDATE Users SET Password = ? WHERE Id = ? OR Id = ?").bind(newPw, rawId, userId).run();
-  }
-  return c.body(null, 204);
-});
-app.post("/users/:userId/password", async (c) => {
-  const rawId = c.req.param("userId");
-  const userId = toValidUuid(rawId);
-  let body: any = {};
-  try { body = await c.req.json(); } catch (e) {}
-  const newPw = body.NewPw || body.NewPassword || "";
-  if (newPw) {
-    await c.env.DB.prepare("UPDATE Users SET Password = ? WHERE Id = ? OR Id = ?").bind(newPw, rawId, userId).run();
-  }
-  return c.body(null, 204);
-});
+// Troca de senha, como no Jellyfin: o próprio usuário informa a senha atual;
+// um admin pode redefinir a de outro usuário (ResetPassword = sem senha).
+const handleChangePassword = async (c: any, rawId: string) => {
+  const auth = currentAuth(c);
+  if (!auth) return c.json({ error: "Unauthorized" }, 401);
+  const user = await findUserByAnyId(c.env.DB, rawId);
+  if (!user) return c.json({ error: "User not found" }, 404);
+  const body: any = await c.req.json().catch(() => ({}));
+  const isSelf = auth.userId === user.Id;
 
-app.delete("/Users/:userId", async (c) => {
-  const rawId = c.req.param("userId");
-  const userId = toValidUuid(rawId);
-  if (userId !== DEFAULT_ADMIN_ID && rawId !== DEFAULT_ADMIN_ID && rawId.toLowerCase() !== "admin") {
-    await c.env.DB.prepare("DELETE FROM Users WHERE Id = ? OR Id = ?").bind(rawId, userId).run();
+  if (body.ResetPassword) {
+    if (!auth.isAdmin) return c.json({ error: "Forbidden" }, 403);
+    await c.env.DB.prepare("UPDATE Users SET Password = '' WHERE Id = ?").bind(user.Id).run();
+    await deleteUserSessions(c.env.DB, user.Id, isSelf ? auth.token : undefined);
+    return c.body(null, 204);
   }
-  return c.body(null, 204);
-});
-app.delete("/users/:userId", async (c) => {
-  const rawId = c.req.param("userId");
-  const userId = toValidUuid(rawId);
-  if (userId !== DEFAULT_ADMIN_ID && rawId !== DEFAULT_ADMIN_ID && rawId.toLowerCase() !== "admin") {
-    await c.env.DB.prepare("DELETE FROM Users WHERE Id = ? OR Id = ?").bind(rawId, userId).run();
+
+  if (isSelf || !auth.isAdmin) {
+    const ip = clientIp(c);
+    if (await tooManyFailures(c.env.DB, ip, user.Name)) {
+      return c.json({ error: "Too many failed attempts. Try again later." }, 429);
+    }
+    const current = String(body.CurrentPw ?? body.CurrentPassword ?? "");
+    const ok = await verifyPassword(user.Password, current);
+    if (!ok.ok) {
+      await recordFailure(c.env.DB, ip, user.Name);
+      return c.json({ error: "Invalid user or password entered." }, 403);
+    }
   }
+
+  const newPw = String(body.NewPw ?? body.NewPassword ?? "");
+  const hashed = await hashPassword(newPw, hashIterations(c));
+  await c.env.DB.prepare("UPDATE Users SET Password = ? WHERE Id = ?").bind(hashed, user.Id).run();
+  await deleteUserSessions(c.env.DB, user.Id, isSelf ? auth.token : undefined);
   return c.body(null, 204);
-});
+};
+app.post("/Users/:userId/Password", (c) => handleChangePassword(c, c.req.param("userId")));
+app.post("/users/:userId/password", (c) => handleChangePassword(c, c.req.param("userId")));
+
+const handleDeleteUser = async (c: any) => {
+  const user = await findUserByAnyId(c.env.DB, c.req.param("userId"));
+  if (!user) return c.body(null, 204);
+  const auth = currentAuth(c);
+  if (user.Id === DEFAULT_ADMIN_ID || (auth && auth.userId === user.Id)) {
+    return c.json({ error: "Cannot delete this user" }, 400);
+  }
+  await deleteUserSessions(c.env.DB, user.Id);
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM Users WHERE Id = ?").bind(user.Id),
+    c.env.DB.prepare("DELETE FROM UserItemData WHERE UserId = ?").bind(toValidUuid(user.Id)),
+  ]);
+  return c.body(null, 204);
+};
+app.delete("/Users/:userId", handleDeleteUser);
+app.delete("/users/:userId", handleDeleteUser);
 
 
 // Post-login UI Requirements
@@ -1403,14 +1505,20 @@ app.post("/Sessions/Capabilities", (c) => new Response(null, { status: 204 }));
 app.post("/sessions/capabilities", (c) => new Response(null, { status: 204 }));
 app.post("/Sessions/Capabilities/Full", (c) => new Response(null, { status: 204 }));
 app.post("/sessions/capabilities/full", (c) => new Response(null, { status: 204 }));
-app.post("/Sessions/Logout", (c) => new Response(null, { status: 204 }));
-app.post("/sessions/logout", (c) => new Response(null, { status: 204 }));
+const handleLogout = async (c: any) => {
+  const token = currentToken(c);
+  if (token) await deleteSession(c.env.DB, token);
+  return new Response(null, { status: 204 });
+};
+app.post("/Sessions/Logout", handleLogout);
+app.post("/sessions/logout", handleLogout);
 const handlePlayingProgress = async (c: any) => {
   try {
     const body = await c.req.json().catch(() => ({}));
     const rawItemId = body.ItemId || body.itemId || c.req.query("ItemId") || c.req.query("itemId");
     const positionTicks = body.PositionTicks ?? body.positionTicks ?? parseInt(c.req.query("PositionTicks") || c.req.query("positionTicks") || "0");
-    const userId = toValidUuid(body.UserId || body.userId || c.req.query("UserId") || c.req.query("userId"));
+    // v2: o progresso é sempre do usuário logado (não do UserId enviado pelo cliente).
+    const userId = currentUserId(c);
     if (rawItemId && positionTicks > 0) {
       const item = await resolveItem(c.env.DB, rawItemId);
       const dbId = item ? item.Id : rawItemId;
@@ -1427,7 +1535,8 @@ const handlePlayingStopped = async (c: any) => {
     const body = await c.req.json().catch(() => ({}));
     const rawItemId = body.ItemId || body.itemId || c.req.query("ItemId") || c.req.query("itemId");
     const positionTicks = body.PositionTicks ?? body.positionTicks ?? parseInt(c.req.query("PositionTicks") || c.req.query("positionTicks") || "0");
-    const userId = toValidUuid(body.UserId || body.userId || c.req.query("UserId") || c.req.query("userId"));
+    // v2: o progresso é sempre do usuário logado (não do UserId enviado pelo cliente).
+    const userId = currentUserId(c);
     let played = 0;
     if (rawItemId) {
       const item: any = await resolveItem(c.env.DB, rawItemId);
@@ -1951,26 +2060,6 @@ app.get("/Environment/DirectoryContents", async (c) => {
   }
 });
 
-app.get("/DebugDrive", async (c) => {
-  try {
-    const gdrive = new GoogleDrive(c.env);
-    const token = await gdrive.getAccessToken();
-    let urlBase = `https://www.googleapis.com/drive/v3/files?pageSize=1000&fields=nextPageToken,files(id,name,mimeType,size,createdTime,shortcutDetails)&includeItemsFromAllDrives=true&supportsAllDrives=true`;
-    if (gdrive.teamDriveId && gdrive.teamDriveId.trim() !== '') {
-      urlBase += `&q='${gdrive.teamDriveId}'%20in%20parents%20and%20trashed=false&corpora=drive&driveId=${gdrive.teamDriveId}`;
-    } else {
-      urlBase += `&q='root'%20in%20parents%20and%20trashed=false`;
-    }
-    const res = await fetch(urlBase, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    const text = await res.text();
-    return c.json({ status: res.status, url: urlBase, response: text });
-  } catch (e: any) {
-    return c.json({ error: e.message });
-  }
-});
-
 app.get("/Environment/ParentPath", async (c) => {
   let path = c.req.query("path");
   const idMatch = path?.match(/[-\w]{25,}/);
@@ -2098,7 +2187,9 @@ app.post("/Backup/Restore", async (c) => {
     if (!fileId) {
       return c.text("Missing fileId or ArchiveFileName", 400);
     }
+    if (!(await isKnownBackup(c.env, fileId))) return c.text("Backup not found", 404);
     const result = await restoreDatabaseBackup(c.env, fileId);
+    await fixUuids(c.env.DB, true); // backups da v1 não guardavam Uuid
     return c.json(result);
   } catch (e: any) {
     return c.text("Restore failed: " + e.message, 500);
@@ -2106,9 +2197,27 @@ app.post("/Backup/Restore", async (c) => {
 });
 
 
+/** Só aceita IDs que são de fato backups do DriveFlin (não qualquer arquivo do Drive). */
+async function isKnownBackup(env: any, fileId: string): Promise<boolean> {
+  if (!fileId) return false;
+  const list = await listDatabaseBackups(env);
+  return list.some((b: any) => b.Path === fileId);
+}
+
 app.get("/Backup/:fileId/Download", async (c) => {
   const fileId = c.req.param("fileId");
+  if (!(await isKnownBackup(c.env, fileId))) return c.text("File not found", 404);
   try {
+    if (fileId.startsWith("backup_")) {
+      const row: any = await c.env.DB.prepare("SELECT Data FROM Backups WHERE Id = ?").bind(fileId).first();
+      if (!row?.Data) return c.text("File not found", 404);
+      return new Response(row.Data, {
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Disposition": `attachment; filename="DriveFlin_Backup_${fileId}.json"`,
+        },
+      });
+    }
     const gdrive = new GoogleDrive(c.env);
     const token = await gdrive.getAccessToken();
     const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`, {
@@ -2129,6 +2238,7 @@ app.get("/Backup/:fileId/Download", async (c) => {
 
 app.get("/Backup/:fileId", async (c) => {
   const fileId = c.req.param("fileId");
+  if (fileId !== "Manifest" && !(await isKnownBackup(c.env, fileId))) return c.notFound();
   try {
     const gdrive = new GoogleDrive(c.env);
     const file = await gdrive.getFile(fileId);
@@ -2663,7 +2773,7 @@ const parseMediaInfo = (row: any) => {
 // Home Screen & Latest & Search Handlers
 const handleResume = async (c: any) => {
   try {
-    const userId = c.req.param("userId") || c.req.query("userId") || DEFAULT_ADMIN_ID;
+    const userId = c.req.param("userId") || c.req.query("userId") || currentUserId(c);
     const mediaTypes = c.req.query("mediaTypes") || c.req.query("MediaTypes");
     let typeFilter = "AND i.Type IN ('Movie', 'Episode')";
     if (mediaTypes) {
@@ -2695,7 +2805,7 @@ const handleResume = async (c: any) => {
       const isVideo = row.Type === "Movie" || row.Type === "Episode";
       const isAudio = row.Type === "Audio";
       const parsed = parseMediaInfo(row);
-      const container = isAudio ? "mp3" : (row.Name.endsWith(".mkv") ? "mkv" : "mp4");
+      const container = detectContainer(row);
       const itemUuid = row.Uuid || toValidUuid(row.Id);
 
       let sId = undefined;
@@ -2775,7 +2885,7 @@ app.get("/Users/:userId/Items/Resume", handleResume);
 app.get("/users/:userId/items/resume", handleResume);
 
 const handleLatestItems = async (c: any) => {
-  const userId = c.req.param("userId") || c.req.query("userId") || DEFAULT_ADMIN_ID;
+  const userId = c.req.param("userId") || c.req.query("userId") || currentUserId(c);
   let parentId = c.req.query("parentId") || c.req.query("ParentId");
   const limit = parseInt(c.req.query("limit") || c.req.query("Limit") || "16");
   const types = getQueryArray(c, "includeItemTypes");
@@ -2821,7 +2931,7 @@ const handleLatestItems = async (c: any) => {
     const isAudio = row.Type === "Audio";
     const isSeries = row.Type === "Series";
     const parsed = parseMediaInfo(row);
-    const container = isAudio ? "mp3" : (row.Name.endsWith(".mkv") ? "mkv" : "mp4");
+    const container = detectContainer(row);
     const yearMatch = row.Name.match(/\((\d{4})\)/);
     const productionYear = yearMatch ? parseInt(yearMatch[1]) : 2024;
     const itemUuid = row.Uuid || toValidUuid(row.Id);
@@ -2949,13 +3059,60 @@ app.get("/Search/Hints", async (c) => {
   });
 });
 
-function buildMediaSource(row: any, parsed: any, isVideo: boolean, isAudio: boolean, container: string, requestedId?: string) {
+// Containers e MIME types reconhecidos (extensão → container do Jellyfin).
+const CONTAINER_BY_EXT: Record<string, string> = {
+  mp4: "mp4", m4v: "m4v", mkv: "mkv", webm: "webm", avi: "avi", mov: "mov",
+  wmv: "wmv", asf: "asf", mpg: "mpeg", mpeg: "mpeg", ts: "ts", m2ts: "m2ts", mts: "m2ts",
+  flv: "flv", "3gp": "3gp", ogv: "ogv",
+  mp3: "mp3", flac: "flac", m4a: "m4a", aac: "aac", ogg: "ogg", oga: "ogg", opus: "opus", wav: "wav", wma: "wma",
+};
+const MIME_BY_CONTAINER: Record<string, string> = {
+  mp4: "video/mp4", m4v: "video/mp4", mkv: "video/x-matroska", webm: "video/webm",
+  avi: "video/x-msvideo", mov: "video/quicktime", wmv: "video/x-ms-wmv", asf: "video/x-ms-asf",
+  mpeg: "video/mpeg", ts: "video/mp2t", m2ts: "video/mp2t", flv: "video/x-flv", "3gp": "video/3gpp",
+  ogv: "video/ogg",
+  mp3: "audio/mpeg", flac: "audio/flac", m4a: "audio/mp4", aac: "audio/aac", ogg: "audio/ogg",
+  opus: "audio/ogg", wav: "audio/wav", wma: "audio/x-ms-wma",
+};
+
+function containerFromName(name: any): string | null {
+  const m = String(name || "").toLowerCase().match(/\.([a-z0-9]{2,4})$/);
+  return m && CONTAINER_BY_EXT[m[1]] ? CONTAINER_BY_EXT[m[1]] : null;
+}
+
+/** Container real do arquivo: nome → nome original no Drive → ffprobe → padrão. */
+function detectContainer(row: any): string {
+  const byName = containerFromName(row?.Name) || containerFromName(row?.EncryptedName);
+  if (byName) return byName;
+  try {
+    const info = row?.MediaInfo ? JSON.parse(row.MediaInfo) : null;
+    const byFile = containerFromName(info?.format?.filename);
+    if (byFile) return byFile;
+    const fmt = String(info?.format?.format_name || "");
+    if (fmt.includes("matroska")) return "mkv";
+    if (fmt.includes("mp4") || fmt.includes("mov")) return "mp4";
+    if (fmt === "avi") return "avi";
+    if (fmt.includes("mpegts")) return "ts";
+    if (fmt.includes("mpeg")) return "mpeg";
+    if (fmt === "mp3") return "mp3";
+    if (fmt === "flac") return "flac";
+  } catch (e) {}
+  return row?.Type === "Audio" ? "mp3" : "mp4";
+}
+
+function mimeForContainer(container: string, isAudio = false): string {
+  return MIME_BY_CONTAINER[String(container || "").toLowerCase()] || (isAudio ? "audio/mpeg" : "video/mp4");
+}
+
+function buildMediaSource(row: any, parsed: any, isVideo: boolean, isAudio: boolean, container: string, requestedId?: string, apiKey?: string) {
   const audioStream = parsed.MediaStreams.find((s: any) => s.Type === "Audio");
   const defaultAudioIdx = audioStream ? audioStream.Index : (isVideo ? 1 : 0);
   const mediaId = requestedId || row.Uuid || toValidUuid(row.Id);
+  // Como no Jellyfin, a URL leva o token (players como Chromecast/ExoPlayer não mandam cabeçalho).
+  const keyParam = apiKey ? `api_key=${encodeURIComponent(apiKey)}` : "";
   const directUrl = isAudio
-    ? `/Audio/${mediaId}/stream.${container}`
-    : `/Videos/${mediaId}/stream.${container}?Static=true&mediaSourceId=${mediaId}`;
+    ? `/Audio/${mediaId}/stream.${container}?Static=true&mediaSourceId=${mediaId}${keyParam ? "&" + keyParam : ""}`
+    : `/Videos/${mediaId}/stream.${container}?Static=true&mediaSourceId=${mediaId}${keyParam ? "&" + keyParam : ""}`;
 
   return {
     Protocol: "File",
@@ -2972,7 +3129,8 @@ function buildMediaSource(row: any, parsed: any, isVideo: boolean, isAudio: bool
     IgnoreDts: false,
     IgnoreIndex: false,
     GenPtsInput: false,
-    SupportsTranscoding: true,
+    // Sem servidor não há transcodificação: o arquivo é entregue como está.
+    SupportsTranscoding: false,
     SupportsDirectStream: true,
     SupportsDirectPlay: true,
     IsInfiniteStream: false,
@@ -2992,13 +3150,12 @@ function buildMediaSource(row: any, parsed: any, isVideo: boolean, isAudio: bool
     DefaultSubtitleStreamIndex: -1,
     HasSegments: false,
     DirectStreamUrl: directUrl,
-    TranscodingUrl: directUrl,
   };
 }
 
 // Helper to get Item by Id from DB
 const getItemById = async (c: any, itemId: string) => {
-  const userId = c.req.param("userId") || c.req.query("userId") || DEFAULT_ADMIN_ID;
+  const userId = c.req.param("userId") || c.req.query("userId") || currentUserId(c);
   
   // 1. Check if Library (by Id or Uuid)
   const lib = await resolveLibrary(c.env.DB, itemId);
@@ -3064,7 +3221,7 @@ const getItemById = async (c: any, itemId: string) => {
   const isSeason = row.Type === "Season";
 
   const parsed = parseMediaInfo(row);
-  const container = isAudio ? "mp3" : (row.Name.endsWith(".mkv") ? "mkv" : "mp4");
+  const container = detectContainer(row);
 
   let childCount: number | undefined = undefined;
   let recursiveCount: number | undefined = undefined;
@@ -3238,7 +3395,7 @@ const getItemById = async (c: any, itemId: string) => {
     Etag: getImageTag(row.Id) || "etag_123",
     ImageBlurHashes: {},
     MediaSources: (isVideo || isAudio)
-      ? [buildMediaSource(row, parsed, isVideo, isAudio, container, itemUuid)]
+      ? [buildMediaSource(row, parsed, isVideo, isAudio, container, itemUuid, currentToken(c))]
       : undefined,
     MediaStreams: parsed.MediaStreams,
   };
@@ -3265,6 +3422,18 @@ app.get("/Items/:itemId", async (c) => {
   if (item) return c.json(item);
   return c.notFound();
 });
+
+// Hosts aceitos quando a URL da imagem vem do cliente (?tag=). Evita usar o Worker
+// como proxy aberto para qualquer site.
+const REMOTE_IMAGE_HOSTS = new Set(["image.tmdb.org", "placehold.co"]);
+function isAllowedRemoteImage(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && REMOTE_IMAGE_HOSTS.has(u.hostname);
+  } catch (e) {
+    return false;
+  }
+}
 
 async function serveImageOrProxy(c: any, fileId: string | null | undefined, fallbackText?: string, isBackdrop?: boolean): Promise<Response> {
   const fallbackDims = isBackdrop ? "1280x720" : "400x600";
@@ -3354,7 +3523,8 @@ const imageHandler = async (c: any) => {
 
   // 1. Branding Logo
   if (itemId === "branding_logo") {
-    return serveImageOrProxy(c, "1uLeX5LtyVsmi9-M08ho7qEEwVcAUH7PC", "Jellyfin");
+    if (c.env.BRANDING_LOGO_FILE_ID) return serveImageOrProxy(c, c.env.BRANDING_LOGO_FILE_ID, "DriveFlin");
+    return c.redirect("/assets/img/logo.png", 302);
   }
 
   // 2. Library Cover
@@ -3371,13 +3541,13 @@ const imageHandler = async (c: any) => {
   // 2.1 Person Images
   if (itemId.startsWith("person_")) {
     const tag = c.req.query("tag") || c.req.query("Tag");
-    if (tag && (tag.startsWith("http://") || tag.startsWith("https://"))) {
+    if (tag && isAllowedRemoteImage(tag)) {
       return serveImageOrProxy(c, tag, itemId);
     }
     const tmdbPersonId = itemId.replace("person_", "");
     if (/^\d+$/.test(tmdbPersonId)) {
       try {
-        const pRes = await fetch(`https://api.themoviedb.org/3/person/${tmdbPersonId}?api_key=844dba0bfd8f3a4f3799f6130ef9e335`, {
+        const pRes = await fetch(`https://api.themoviedb.org/3/person/${tmdbPersonId}?api_key=${encodeURIComponent(c.env.TMDB_API_KEY || "")}`, {
           headers: {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json",
@@ -3397,7 +3567,7 @@ const imageHandler = async (c: any) => {
   const item: any = await resolveItem(c.env.DB, itemId);
   if (!item) {
     const tag = c.req.query("tag") || c.req.query("Tag");
-    if (tag && (tag.startsWith("http://") || tag.startsWith("https://"))) {
+    if (tag && isAllowedRemoteImage(tag)) {
       return serveImageOrProxy(c, tag, itemId, isBackdrop);
     }
     return c.notFound();
@@ -3666,7 +3836,7 @@ app.post("/Items/:itemId/RemoteImages/Download", async (c) => {
 });
 
 const itemsHandler = async (c: any) => {
-  const userId = c.req.param("userId") || c.req.query("userId") || c.req.query("UserId") || DEFAULT_ADMIN_ID;
+  const userId = c.req.param("userId") || c.req.query("userId") || c.req.query("UserId") || currentUserId(c);
   let parentId = c.req.query("parentId") || c.req.query("ParentId");
   const ids = c.req.query("ids") || c.req.query("Ids");
   const includeItemTypes = getQueryArray(c, "includeItemTypes");
@@ -3928,7 +4098,7 @@ const itemsHandler = async (c: any) => {
     const isSeries = row.Type === "Series";
     const parsed = parseMediaInfo(row);
     const tmdb = parsed.tmdb || {};
-    const container = isAudio ? "mp3" : (row.Name.endsWith(".mkv") ? "mkv" : "mp4");
+    const container = detectContainer(row);
     
     let cleanName = row.Name;
     if (isSeries || row.Type === "Movie") {
@@ -3980,7 +4150,7 @@ const itemsHandler = async (c: any) => {
       AlbumArtist: isAudio ? "Vários Artistas" : undefined,
       AlbumArtists: isAudio ? [{ Name: "Vários Artistas", Id: toValidUuid("artist_varios"), Type: "MusicArtist" }] : undefined,
       MediaSources: (isVideo || isAudio)
-        ? [buildMediaSource(row, parsed, isVideo, isAudio, container, itemUuid)]
+        ? [buildMediaSource(row, parsed, isVideo, isAudio, container, itemUuid, currentToken(c))]
         : undefined,
     };
 
@@ -4011,156 +4181,8 @@ const itemsHandler = async (c: any) => {
   });
 };
 
-app.post("/internal/syncLibrary", async (c) => {
-  try {
-    const { libId, folderId, isTvLib, isMovieLib, isMusicLib } = await c.req.json();
-    const gdrive = new GoogleDrive(c.env);
-    const rc = new Cipher('base32');
-    rc.dirNameEncrypt = false;
-    if (c.env.RCLONE_PASS) await rc.key(c.env.RCLONE_PASS, c.env.RCLONE_SALT || '');
-
-    const topList: any = await gdrive.listFolder(folderId);
-    if (!topList || !topList.files) return c.json({ success: true });
-
-    if (isTvLib) {
-      for (const seriesFolder of topList.files) {
-        if (seriesFolder.mimeType !== 'application/vnd.google-apps.folder') continue;
-        let seriesName = seriesFolder.name;
-        try { seriesName = await rc.decryptFileName(seriesFolder.name); } catch(e) {}
-        if (/^S\d+/i.test(seriesName) || /^Season/i.test(seriesName) || /^Temporada/i.test(seriesName)) continue;
-
-        const seriesId = `series_${seriesFolder.id}`;
-        await c.env.DB.prepare(`
-          INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, FolderId, Uuid)
-          VALUES (?, ?, ?, 'Series', ?, ?, ?)
-          ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, FolderId = excluded.FolderId, Uuid = excluded.Uuid
-        `).bind(seriesId, libId, libId, seriesName, seriesFolder.id, toValidUuid(seriesId)).run();
-
-        const url = new URL(c.req.url);
-        url.pathname = '/internal/syncSeries';
-        const syncPromise = fetch(url.toString(), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ libraryId: libId, seriesId, seriesFolderId: seriesFolder.id })
-        });
-        c.executionCtx?.waitUntil(syncPromise);
-      }
-    } else if (isMovieLib) {
-      for (const item of topList.files) {
-        try {
-          if (item.mimeType === 'application/vnd.google-apps.folder') {
-            const subFiles: any = await gdrive.listFolder(item.id);
-            for (const sub of (subFiles.files || [])) {
-              let name = sub.name;
-              try { name = await rc.decryptFileName(sub.name); } catch(e) {}
-              if (name.match(/\.(mp4|mkv|avi|webm|m4v|mov|wmv)$/i)) {
-                const rowId = `movie_${sub.id}`;
-                await c.env.DB.prepare(`
-                  INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, FileId, EncryptedName, Size, Uuid)
-                  VALUES (?, ?, ?, 'Movie', ?, ?, ?, ?, ?)
-                  ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, Size = excluded.Size, FileId = excluded.FileId, EncryptedName = excluded.EncryptedName, Uuid = excluded.Uuid
-                `).bind(rowId, libId, libId, name, sub.id, sub.name, sub.size || 0, toValidUuid(rowId)).run();
-              }
-            }
-          } else {
-            let name = item.name;
-            try { name = await rc.decryptFileName(item.name); } catch(e) {}
-            if (name.match(/\.(mp4|mkv|avi|webm|m4v|mov|wmv)$/i)) {
-              const rowId = `movie_${item.id}`;
-              await c.env.DB.prepare(`
-                INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, FileId, EncryptedName, Size, Uuid)
-                VALUES (?, ?, ?, 'Movie', ?, ?, ?, ?, ?)
-                ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, Size = excluded.Size, FileId = excluded.FileId, EncryptedName = excluded.EncryptedName, Uuid = excluded.Uuid
-              `).bind(rowId, libId, libId, name, item.id, item.name, item.size || 0, toValidUuid(rowId)).run();
-            }
-          }
-        } catch (err) {}
-      }
-    }
-    return c.json({ success: true });
-  } catch (err: any) {
-    return c.json({ error: err.message, stack: err.stack }, 500);
-  }
-});
-
-app.post("/internal/syncSeries", async (c) => {
-  try {
-    const { libraryId, seriesId, seriesFolderId } = await c.req.json();
-    const gdrive = new GoogleDrive(c.env);
-    const rc = new Cipher('base32');
-    rc.dirNameEncrypt = false;
-    if (c.env.RCLONE_PASS) await rc.key(c.env.RCLONE_PASS, c.env.RCLONE_SALT || '');
-
-    const seasonList: any = await gdrive.listFolder(seriesFolderId);
-    for (const seasonItem of (seasonList.files || [])) {
-      if (seasonItem.mimeType === 'application/vnd.google-apps.folder') {
-        let seasonName = seasonItem.name;
-        try { seasonName = await rc.decryptFileName(seasonItem.name); } catch(e) {}
-        const sMatch = seasonName.match(/S(\d+)|Season\s*(\d+)|Temporada\s*(\d+)/i);
-        const seasonNumber = sMatch ? parseInt(sMatch[1] || sMatch[2] || sMatch[3]) : 1;
-        const seasonId = `season_${seasonItem.id}`;
-
-        await c.env.DB.prepare(`
-          INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, IndexNumber, FolderId, Uuid)
-          VALUES (?, ?, ?, 'Season', ?, ?, ?, ?)
-          ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, IndexNumber = excluded.IndexNumber, FolderId = excluded.FolderId, Uuid = excluded.Uuid
-        `).bind(seasonId, seriesId, libraryId, seasonName, seasonNumber, seasonItem.id, toValidUuid(seasonId)).run();
-
-        const epList: any = await gdrive.listFolder(seasonItem.id);
-        for (const ep of (epList.files || [])) {
-          if (ep.mimeType === 'application/vnd.google-apps.folder') continue;
-          let epName = ep.name;
-          try { epName = await rc.decryptFileName(ep.name); } catch(e) {}
-          const rowEpId = `ep_${ep.id}`;
-          if (epName.match(/\.(mp4|mkv|avi|webm|m4v|mov|wmv)$/i)) {
-            const epMatch = epName.match(/(?:[Ss]\d+)?\s*[Ee](\d+)|\b\d+x(\d+)\b|\bEp[._\s]*(\d+)\b|(?:^|\D)(\d{1,3})\s*\./i);
-            const epNumber = epMatch ? parseInt(epMatch[1] || epMatch[2] || epMatch[3] || epMatch[4]) : 1;
-            await c.env.DB.prepare(`
-              INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, IndexNumber, ParentIndexNumber, FileId, EncryptedName, Size, Uuid)
-              VALUES (?, ?, ?, 'Episode', ?, ?, ?, ?, ?, ?, ?)
-              ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, IndexNumber = excluded.IndexNumber, ParentIndexNumber = excluded.ParentIndexNumber, FileId = excluded.FileId, EncryptedName = excluded.EncryptedName, Size = excluded.Size, Uuid = excluded.Uuid
-            `).bind(rowEpId, seasonId, libraryId, epName, epNumber, seasonNumber, ep.id, ep.name, ep.size || 0, toValidUuid(rowEpId)).run();
-          }
-        }
-      } else {
-        let epName = seasonItem.name;
-        try { epName = await rc.decryptFileName(seasonItem.name); } catch(e) {}
-        if (epName.match(/\.(mp4|mkv|avi|webm|m4v|mov|wmv)$/i)) {
-          const defaultSeasonId = `season_${seriesFolderId}_s1`;
-          await c.env.DB.prepare(`
-            INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, IndexNumber, FolderId, Uuid)
-            VALUES (?, ?, ?, 'Season', 'Season 1', 1, ?, ?)
-            ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, IndexNumber = excluded.IndexNumber, FolderId = excluded.FolderId, Uuid = excluded.Uuid
-          `).bind(defaultSeasonId, seriesId, libraryId, seriesFolderId, toValidUuid(defaultSeasonId)).run();
-
-          const rowEpId = `ep_${seasonItem.id}`;
-          const epMatch = epName.match(/(?:[Ss]\d+)?\s*[Ee](\d+)|\b\d+x(\d+)\b|\bEp[._\s]*(\d+)\b|(?:^|\D)(\d{1,3})\s*\./i);
-          const epNumber = epMatch ? parseInt(epMatch[1] || epMatch[2] || epMatch[3] || epMatch[4]) : 1;
-          await c.env.DB.prepare(`
-            INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, IndexNumber, ParentIndexNumber, FileId, EncryptedName, Size, Uuid)
-            VALUES (?, ?, ?, 'Episode', ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, IndexNumber = excluded.IndexNumber, ParentIndexNumber = excluded.ParentIndexNumber, FileId = excluded.FileId, EncryptedName = excluded.EncryptedName, Size = excluded.Size, Uuid = excluded.Uuid
-          `).bind(rowEpId, defaultSeasonId, libraryId, epName, epNumber, 1, seasonItem.id, seasonItem.name, seasonItem.size || 0, toValidUuid(rowEpId)).run();
-        }
-      }
-    }
-    return c.json({ success: true });
-  } catch (err: any) {
-    return c.json({ error: err.message, stack: err.stack }, 500);
-  }
-});
-
 app.get("/Items", itemsHandler);
 
-app.get("/Debug/ListFolder/:id", async (c) => {
-  const gdrive = new GoogleDrive(c.env);
-  try {
-    const res = await gdrive.listFolder(c.req.param("id"));
-    return c.json(res);
-  } catch (err: any) {
-    return c.json({ error: err.message });
-  }
-});
 app.get("/items", itemsHandler);
 app.get("/Users/:userId/Items", itemsHandler);
 app.get("/users/:userId/items", itemsHandler);
@@ -4222,7 +4244,7 @@ app.get("/Shows/:itemId/Seasons", handleShowsSeasons);
 app.get("/shows/:itemId/seasons", handleShowsSeasons);
 
 const handleShowsEpisodes = async (c: any) => {
-  const userId = c.req.param("userId") || c.req.query("userId") || c.req.query("UserId") || DEFAULT_ADMIN_ID;
+  const userId = c.req.param("userId") || c.req.query("userId") || c.req.query("UserId") || currentUserId(c);
   const itemId = c.req.param("itemId"); // series id or season id
   const rawSeasonId = c.req.query("seasonId") || c.req.query("SeasonId");
 
@@ -4303,7 +4325,7 @@ const handleShowsEpisodes = async (c: any) => {
   const items = results.map((row: any) => {
     const parsed = parseMediaInfo(row);
     const isAudio = row.Type === "Audio";
-    const container = isAudio ? "mp3" : (row.Name.endsWith(".mkv") ? "mkv" : "mp4");
+    const container = detectContainer(row);
     const epUuid = row.Uuid || toValidUuid(row.Id);
     const seasonUuid = row.ParentId ? toValidUuid(row.ParentId) : undefined;
 
@@ -4372,7 +4394,7 @@ const handleShowsEpisodes = async (c: any) => {
       EnableMediaSourceDisplay: true,
       Etag: getImageTag(row.Id) || "etag_123",
       ImageBlurHashes: {},
-      MediaSources: [buildMediaSource(row, parsed, !isAudio, isAudio, container, epUuid)],
+      MediaSources: [buildMediaSource(row, parsed, !isAudio, isAudio, container, epUuid, currentToken(c))],
       MediaStreams: parsed.MediaStreams,
       Width: parsed.Width,
       Height: parsed.Height,
@@ -4578,7 +4600,7 @@ const handleRemoteSearch = async (c: any, defaultType: "Movie" | "Series" | "Per
   const tmdbId = searchInfo.ProviderIds?.Tmdb || searchInfo.ProviderIds?.tmdb || searchInfo.providerIds?.tmdb || searchInfo.providerIds?.Tmdb;
   const imdbId = searchInfo.ProviderIds?.Imdb || searchInfo.ProviderIds?.imdb || searchInfo.providerIds?.imdb || searchInfo.providerIds?.Imdb;
 
-  const apiKey = c.env.TMDB_API_KEY || "844dba0bfd8f3a4f3799f6130ef9e335";
+  const apiKey = c.env.TMDB_API_KEY || "";
   console.log(`[RemoteSearch] type=${defaultType} query="${query}" year=${year} tmdbId=${tmdbId} imdbId=${imdbId}`);
   const results = await searchTmdbRemote(
     apiKey,
@@ -4697,7 +4719,7 @@ app.post("/items/remotesearch/apply/:itemId", handleRemoteSearchApply);
 
 // Shows NextUp endpoint
 const handleNextUp = async (c: any) => {
-  const userId = c.req.param("userId") || c.req.query("userId") || c.req.query("UserId") || DEFAULT_ADMIN_ID;
+  const userId = c.req.param("userId") || c.req.query("userId") || c.req.query("UserId") || currentUserId(c);
   const rawSeriesId = c.req.query("seriesId") || c.req.query("SeriesId");
   let series: any = null;
   let seriesId = rawSeriesId;
@@ -4782,7 +4804,7 @@ const handleNextUp = async (c: any) => {
     const epUuid = row.Uuid || toValidUuid(row.Id);
     const seasonUuid = row.ParentId ? toValidUuid(row.ParentId) : undefined;
     const userData = buildUserData(epUuid, userDataMap.get(row.Id) || userDataMap.get(epUuid), parsed.RunTimeTicks);
-    const container = row.Name.endsWith(".mkv") ? "mkv" : "mp4";
+    const container = detectContainer(row);
 
     return {
       Name: epName,
@@ -4808,7 +4830,7 @@ const handleNextUp = async (c: any) => {
       ParentBackdropImageTags: sBackdrop ? ["cached"] : undefined,
       UserData: userData,
       DisplayPreferencesId: toValidUuid("displaypref_" + row.Id),
-      MediaSources: [buildMediaSource(row, parsed, true, false, container, epUuid)],
+      MediaSources: [buildMediaSource(row, parsed, true, false, container, epUuid, currentToken(c))],
     };
   }));
 
@@ -4843,13 +4865,16 @@ const handlePlaybackInfo = async (c: any) => {
   const isVideo = row.Type === "Movie" || row.Type === "Episode";
   const isAudio = row.Type === "Audio";
   const parsed = parseMediaInfo(row);
-  const container = isAudio ? "mp3" : (row.Name.endsWith(".mkv") ? "mkv" : "mp4");
+  const container = detectContainer(row);
   const effectiveMediaSourceId = mediaSourceId || row.Uuid || toValidUuid(row.Id);
 
   let allRows = [row];
   if (row.Type === "Movie" || row.Type === "Episode") {
-    const parentCondition = row.ParentId ? `ParentId = '${row.ParentId}'` : (row.LibraryId ? `LibraryId = '${row.LibraryId}'` : "1=1");
-    const siblings = await c.env.DB.prepare(`SELECT * FROM Items WHERE Name = ? AND Type = ? AND ${parentCondition}`).bind(row.Name, row.Type).all();
+    const siblings = row.ParentId
+      ? await c.env.DB.prepare("SELECT * FROM Items WHERE Name = ? AND Type = ? AND ParentId = ?").bind(row.Name, row.Type, row.ParentId).all()
+      : row.LibraryId
+        ? await c.env.DB.prepare("SELECT * FROM Items WHERE Name = ? AND Type = ? AND LibraryId = ?").bind(row.Name, row.Type, row.LibraryId).all()
+        : await c.env.DB.prepare("SELECT * FROM Items WHERE Name = ? AND Type = ?").bind(row.Name, row.Type).all();
     if (siblings.results && siblings.results.length > 0) {
       allRows = siblings.results;
     }
@@ -4857,9 +4882,9 @@ const handlePlaybackInfo = async (c: any) => {
 
   const mediaSources = allRows.map((r: any) => {
     const p = parseMediaInfo(r);
-    const c = r.Type === "Audio" ? "mp3" : (r.Name.endsWith(".mkv") ? "mkv" : "mp4");
+    const cont = detectContainer(r);
     const eId = r.Uuid || toValidUuid(r.Id);
-    return buildMediaSource(r, p, isVideo, isAudio, c, eId);
+    return buildMediaSource(r, p, isVideo, isAudio, cont, eId, currentToken(c));
   });
 
   return c.json({
@@ -4881,7 +4906,24 @@ app.post("/Users/:userId/Items/:itemId/PlaybackInfo", handlePlaybackInfo);
 app.get("/users/:userId/items/:itemId/playbackinfo", handlePlaybackInfo);
 app.post("/users/:userId/items/:itemId/playbackinfo", handlePlaybackInfo);
 
+// Subtitles routes
+const handleSubtitles = (c: any) => {
+  return new Response("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n...\n", {
+    headers: { "Content-Type": "text/vtt; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+  });
+};
+app.all("/Videos/:itemId/:mediaSourceId/Subtitles/:index/*", handleSubtitles);
+app.all("/videos/:itemId/:mediaSourceId/Subtitles/:index/*", handleSubtitles);
+app.all("/videos/:itemId/:mediaSourceId/subtitles/:index/*", handleSubtitles);
+app.all("/Videos/:itemId/Subtitles/:index/*", handleSubtitles);
+app.all("/videos/:itemId/Subtitles/:index/*", handleSubtitles);
+app.all("/videos/:itemId/subtitles/:index/*", handleSubtitles);
+app.all("/Videos/:itemId/Subtitles*", handleSubtitles);
+app.all("/videos/:itemId/subtitles*", handleSubtitles);
+
 const streamHandler = async (c: any) => {
+  // Defesa extra: nunca entrega mídia sem sessão válida.
+  if (!currentAuth(c)) return c.json({ error: "Unauthorized" }, 401);
   try {
     const itemId = c.req.param("itemId");
     const mediaSourceId = c.req.query("mediaSourceId") || c.req.query("MediaSourceId");
@@ -4923,7 +4965,7 @@ const streamHandler = async (c: any) => {
         { method: "HEAD", headers: requestHeaders }
       );
       const headHeaders = new Headers();
-      headHeaders.set("Content-Type", ext === "mp3" ? "audio/mpeg" : (ext === "flac" ? "audio/flac" : (ext === "m4a" ? "audio/mp4" : "video/mp4")));
+      headHeaders.set("Content-Type", mimeForContainer(CONTAINER_BY_EXT[ext.toLowerCase()] || detectContainer(item), item.Type === "Audio"));
       headHeaders.set("Accept-Ranges", "bytes");
       headHeaders.set("Access-Control-Allow-Origin", "*");
       headHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
@@ -4940,18 +4982,16 @@ const streamHandler = async (c: any) => {
     );
 
     if (!gdriveResponse.ok && gdriveResponse.status !== 206) {
-      const errText = await gdriveResponse.text();
-      return c.text(
-        "Failed to fetch from gdrive: " +
-          gdriveResponse.status +
-          " body: " +
-          errText,
-        500,
-      );
+      const errText = await gdriveResponse.text().catch(() => "");
+      console.error("[stream] Drive respondeu", gdriveResponse.status, errText.slice(0, 300));
+      if (gdriveResponse.status === 416) {
+        return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${item.Size || "*"}` } });
+      }
+      return c.text("Stream unavailable", gdriveResponse.status === 404 ? 404 : 502);
     }
 
     const responseHeaders = new Headers();
-    responseHeaders.set("Content-Type", ext === "mp3" ? "audio/mpeg" : (ext === "flac" ? "audio/flac" : (ext === "m4a" ? "audio/mp4" : "video/mp4")));
+    responseHeaders.set("Content-Type", mimeForContainer(CONTAINER_BY_EXT[ext.toLowerCase()] || detectContainer(item), item.Type === "Audio"));
     responseHeaders.set("Accept-Ranges", "bytes");
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
@@ -4976,7 +5016,8 @@ const streamHandler = async (c: any) => {
       headers: responseHeaders,
     });
   } catch (e: any) {
-    return c.text(e.message, 500);
+    console.error("[stream] erro:", e);
+    return c.text("Stream unavailable", 500);
   }
 };
 
@@ -5004,6 +5045,35 @@ app.all("/audio/:itemId/universal", streamHandler);
 app.all("/audio/:itemId/*", streamHandler);
 app.all("/audio/:itemId", streamHandler);
 
+async function getOrCreateDriveFolder(gdrive: GoogleDrive, name: string): Promise<string> {
+  const parent = gdrive.teamDriveId || "root";
+  const list: any = await gdrive.listFolder(parent);
+  const existing = (list?.files || []).find(
+    (f: any) => f.mimeType === "application/vnd.google-apps.folder" && f.name === name,
+  );
+  if (existing) return existing.id;
+  return await gdrive.createFolder(name);
+}
+
+// O Jellyfin (ItemUpdateController/ImageController) recebe a imagem como TEXTO base64,
+// com Content-Type image/*. Por isso o corpo é decodificado antes de salvar. Também aceita
+// data URL (data:image/...;base64,...) e bytes binários crus (ex.: curl --data-binary).
+function imageBytesFromBody(raw: ArrayBuffer): ArrayBuffer {
+  const bytes = new Uint8Array(raw);
+  const isRawImage =
+    (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) || // PNG
+    (bytes[0] === 0xff && bytes[1] === 0xd8) || // JPEG
+    (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) || // GIF
+    (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46); // RIFF (WEBP)
+  if (isRawImage) return raw;
+  const text = new TextDecoder().decode(bytes).trim().replace(/^data:image\/[a-z0-9.+-]+;base64,/i, "").replace(/\s+/g, "");
+  if (!text || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) return raw;
+  const bin = atob(text);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+
 const handleImageUpload = async (c: any) => {
   try {
     const itemId = c.req.param("itemId");
@@ -5030,18 +5100,9 @@ const handleImageUpload = async (c: any) => {
     } else {
       const rawBuffer = await c.req.arrayBuffer();
       if (rawBuffer && rawBuffer.byteLength > 0) {
-        const decoder = new TextDecoder();
-        const textSample = decoder.decode(rawBuffer.slice(0, Math.min(100, rawBuffer.byteLength)));
-        if (textSample.startsWith("data:image/") || textSample.includes(";base64,")) {
-          const fullText = decoder.decode(rawBuffer);
-          const cleanBase64 = fullText.replace(/^data:image\/[a-z]+;base64,/, "").trim();
-          const raw = atob(cleanBase64);
-          const u8 = new Uint8Array(raw.length);
-          for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
-          buffer = u8.buffer;
-        } else {
-          buffer = rawBuffer;
-        }
+        const header = contentType.split(";")[0].trim().toLowerCase();
+        if (header.startsWith("image/")) mime = header;
+        buffer = imageBytesFromBody(rawBuffer);
       }
     }
 
@@ -5051,7 +5112,7 @@ const handleImageUpload = async (c: any) => {
     // 1. Try Google Drive upload
     try {
       const gdrive = new GoogleDrive(c.env);
-      const parentFolderId = c.env.GDRIVE_MEDIA_FOLDER_ID || c.env.GDRIVE_TEAM_DRIVE_ID || "1_Wz2S3UojoFgZxkxYMC_TAAavmsfg-aj";
+      const parentFolderId = c.env.GDRIVE_MEDIA_FOLDER_ID || await getOrCreateDriveFolder(gdrive, "DriveFlin_Images");
       imageValue = await gdrive.uploadFile(`${itemId}_${imageType}.jpg`, mime, parentFolderId, buffer);
     } catch (gdriveErr) {
       console.warn("GDrive image upload failed, storing base64 in D1:", gdriveErr);
@@ -5125,27 +5186,35 @@ app.delete("/Items/:itemId/Images/:imageType/:index", handleImageDelete);
 app.post("/Items/:itemId/Images/:imageType/Delete", handleImageDelete);
 app.post("/Items/:itemId/Images/:imageType/:index/Delete", handleImageDelete);
 
-// Subtitles routes
-const handleSubtitles = (c: any) => {
-  return new Response("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n...\n", {
-    headers: { "Content-Type": "text/vtt; charset=utf-8", "Access-Control-Allow-Origin": "*" },
-  });
-};
-app.all("/Videos/:itemId/:mediaSourceId/Subtitles/:index/*", handleSubtitles);
-app.all("/videos/:itemId/:mediaSourceId/Subtitles/:index/*", handleSubtitles);
-app.all("/videos/:itemId/:mediaSourceId/subtitles/:index/*", handleSubtitles);
-app.all("/Videos/:itemId/Subtitles/:index/*", handleSubtitles);
-app.all("/videos/:itemId/Subtitles/:index/*", handleSubtitles);
-app.all("/videos/:itemId/subtitles/:index/*", handleSubtitles);
-app.all("/Videos/:itemId/Subtitles*", handleSubtitles);
-app.all("/videos/:itemId/subtitles*", handleSubtitles);
 
+
+// "/Users/Me/..." é o usuário da sessão (como no Jellyfin). Reescrevemos para o Id real
+// antes do roteamento, para nenhum handler interpretar "me" como o admin.
+async function rewriteMePath(request: Request, env: Bindings): Promise<Request> {
+  const url = new URL(request.url);
+  const m = url.pathname.match(/^\/users\/me(\/.*)?$/i);
+  if (!m) return request;
+  try {
+    const info = extractAuth(request);
+    if (!info.token) return request;
+    const s = await lookupSession(env.DB, info.token, defaultPolicy, toValidUuid);
+    if (!s) return request;
+    url.pathname = `/Users/${s.userUuid}${m[1] || ""}`;
+    return new Request(url.toString(), request);
+  } catch (e) {
+    return request;
+  }
+}
 
 export default {
-  fetch: app.fetch,
-  async scheduled(event: any, env: Bindings, ctx: any) {
+  async fetch(request: Request, rawEnv: Bindings, ctx: any) {
+    // Variáveis vazias depois de um redeploy são completadas com o que foi salvo no KV.
+    const env = await withPersistedVars(rawEnv, ctx);
+    return app.fetch(await rewriteMePath(request, env), env, ctx);
+  },
+  async scheduled(event: any, rawEnv: Bindings, ctx: any) {
     try {
-      ctx.waitUntil(runSync(env));
+      ctx.waitUntil(withPersistedVars(rawEnv, ctx).then((env) => runSync(env)));
     } catch (e) {
       console.error("Scheduled sync error:", e);
     }

@@ -2,6 +2,9 @@ name = "driveflin"
 main = "src/index.ts"
 compatibility_date = "2024-04-05"
 
+# Deploys pelo Git não removem variáveis que existam só no painel da Cloudflare.
+keep_vars = true
+
 [assets]
 directory = "public"
 
@@ -11,10 +14,10 @@ directory = "public"
 # Estes sete campos aparecem no painel da Cloudflare durante a instalação.
 # Eles permanecem aqui para que um novo usuário consiga fazer o setup.
 #
-# Deploys de manutenção devem usar "npm run deploy", que executa Wrangler
-# com --keep-vars e preserva os valores já preenchidos no painel. Não remova
-# este bloco e não use "wrangler deploy" sem --keep-vars em uma instalação
-# que tenha variáveis configuradas diretamente no painel.
+# Persistência: na primeira requisição depois de preenchidos, os valores são
+# gravados no KV (DRIVEFLIN_CONFIG). Quando um commit/redeploy zerar estes campos,
+# o DriveFlin continua usando o que está salvo no KV. Para trocar um valor,
+# basta preencher o campo de novo. Não remova este bloco.
 # ─────────────────────────────────────────────────────────────────────────────
 [vars]
 GDRIVE_CLIENT_ID     = ""
@@ -24,6 +27,10 @@ GDRIVE_TEAM_DRIVE_ID = ""
 TMDB_API_KEY         = ""
 RCLONE_PASS          = ""
 RCLONE_SALT          = ""
+
+# KV criado automaticamente no primeiro deploy (guarda as variáveis de instalação).
+[[kv_namespaces]]
+binding = "DRIVEFLIN_CONFIG"
 
 [[d1_databases]]
 binding = "DB"

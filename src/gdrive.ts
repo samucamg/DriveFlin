@@ -1,3 +1,5 @@
+const tokenCache = new Map<string, { token: string; exp: number }>();
+
 export class GoogleDrive {
   private clientId: string;
   private clientSecret: string;
@@ -7,24 +9,33 @@ export class GoogleDrive {
   private tokenExpiresAt: number = 0;
 
   constructor(env: any) {
-    const c1 = "1028155325038-5t1fh7m";
-    const c2 = "b6815hjqcpalurf0pn183e1l0.apps.googleusercontent.com";
-    this.clientId = (env.GDRIVE_CLIENT_ID || '').trim() || (c1 + c2);
-    
-    const s1 = "GOCSPX-HtsL";
-    const s2 = "ZAO2Rz9oig5CtX1e8msPJR6q";
-    this.clientSecret = (env.GDRIVE_CLIENT_SECRET || '').trim() || (s1 + s2);
-    
-    const r1 = "1//0hWCLVt6rjMVLCgYIARAAGBESNwF-L9IrkQ";
-    const r2 = "pnVTj6Cm90oXkNlVT9IpCo6T8WF_gjoiz25XF5SM1ylpWJOGaR4KynpdNPrZ3qRnM";
-    this.refreshToken = (env.GDRIVE_REFRESH_TOKEN || '').trim() || (r1 + r2);
-    
-    this.teamDriveId = (env.GDRIVE_TEAM_DRIVE_ID || '').trim();
+    // v2: nenhuma credencial embutida. Configure os secrets do Worker:
+    //   GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN (e opcionalmente GDRIVE_TEAM_DRIVE_ID)
+    this.clientId = String(env?.GDRIVE_CLIENT_ID || "").trim();
+    this.clientSecret = String(env?.GDRIVE_CLIENT_SECRET || "").trim();
+    this.refreshToken = String(env?.GDRIVE_REFRESH_TOKEN || "").trim();
+    this.teamDriveId = String(env?.GDRIVE_TEAM_DRIVE_ID || "").trim();
+  }
+
+  isConfigured(): boolean {
+    return !!(this.clientId && this.clientSecret && this.refreshToken);
   }
 
   async getAccessToken(): Promise<string> {
     if (this.accessToken && Date.now() < this.tokenExpiresAt) {
       return this.accessToken;
+    }
+    if (!this.isConfigured()) {
+      throw new Error("Google Drive não configurado: defina GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET e GDRIVE_REFRESH_TOKEN nos secrets do Worker.");
+    }
+
+    // Reaproveita o access token entre requisições do mesmo isolate (evita um refresh por stream).
+    const cacheKey = this.clientId + ":" + this.refreshToken.slice(-12);
+    const cached = tokenCache.get(cacheKey);
+    if (cached && Date.now() < cached.exp) {
+      this.accessToken = cached.token;
+      this.tokenExpiresAt = cached.exp;
+      return cached.token;
     }
 
     const response = await fetch('https://oauth2.googleapis.com/token', {
@@ -41,19 +52,24 @@ export class GoogleDrive {
     });
 
     if (!response.ok) {
-      throw new Error('Failed to refresh token: ' + await response.text());
+      // Não repassa o corpo da resposta do Google para o cliente.
+      const detail = await response.text().catch(() => "");
+      console.error("[gdrive] refresh falhou:", response.status, detail.slice(0, 200));
+      throw new Error('Failed to refresh Google Drive token (' + response.status + ')');
     }
 
     const data: any = await response.json();
     this.accessToken = data.access_token;
-    this.tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000;
-    
+    this.tokenExpiresAt = Date.now() + (Math.max(Number(data.expires_in) || 3600, 120) - 60) * 1000;
+    tokenCache.set(cacheKey, { token: this.accessToken || '', exp: this.tokenExpiresAt });
+
     return this.accessToken || '';
   }
 
   async listFolder(rawFolderId: string = 'root') {
     const idMatch = rawFolderId.match(/[-\w]{25,}/);
-    const folderId = idMatch ? idMatch[0] : rawFolderId;
+    // Evita injeção na query do Drive (aspas/barras) quando o valor não é um ID.
+    const folderId = idMatch ? idMatch[0] : String(rawFolderId).replace(/['\\]/g, "");
 
     const token = await this.getAccessToken();
     const fields = "nextPageToken,files(id,name,mimeType,size,createdTime,driveId,shortcutDetails(targetId,targetMimeType))";

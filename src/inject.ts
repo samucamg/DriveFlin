@@ -1,6 +1,6 @@
 export const injectScript = `
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/prayag17/JellyFlix@latest/default.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/prayag17/JellyFlix@latest/addons/Logo.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/prayag17/JellyFlix@27be594f693204fc6f025502165c7a09a0dfa28e/default.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/prayag17/JellyFlix@27be594f693204fc6f025502165c7a09a0dfa28e/addons/Logo.css">
 <style>
   :root {
     --accent: #e50914 !important;
@@ -44,19 +44,6 @@ export const injectScript = `
     return isNaN(val) ? Date.now() : val;
   };
 
-  const originalAlert = window.alert;
-  window.alert = function(msg) {
-    fetch('/debug_log', { method: 'POST', body: JSON.stringify({ type: 'alert', msg: msg, stack: new Error().stack }) });
-    originalAlert.apply(this, arguments);
-  };
-  const originalError = console.error;
-  console.error = function() {
-    fetch('/debug_log', { method: 'POST', body: JSON.stringify({ type: 'error', args: Array.from(arguments).map(a => a ? a.toString() : 'null') }) });
-    originalError.apply(this, arguments);
-  };
-  window.addEventListener('unhandledrejection', function(event) {
-    fetch('/debug_log', { method: 'POST', body: JSON.stringify({ type: 'unhandledrejection', reason: event.reason ? event.reason.toString() : 'null', stack: event.reason ? event.reason.stack : '' }) });
-  });
 })();
 
   window.addEventListener('load', () => {

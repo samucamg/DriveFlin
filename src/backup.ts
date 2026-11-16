@@ -1,4 +1,5 @@
 import { GoogleDrive } from "./gdrive";
+import { invalidateSessionCache } from "./auth";
 
 export async function getBackupFolderId(gdrive: GoogleDrive): Promise<string> {
   const rootContents: any = await gdrive.listFolder("root");
@@ -40,9 +41,22 @@ export async function createDatabaseBackup(env: any): Promise<any> {
     progress = results;
   } catch (e) {}
 
+  // v2: usuários (senhas já com hash) e progresso/favoritos por usuário.
+  let users: any[] = [];
+  try {
+    const { results } = await env.DB.prepare("SELECT Id, Name, Password, Policy, Configuration FROM Users").all();
+    users = results;
+  } catch (e) {}
+
+  let userItemData: any[] = [];
+  try {
+    const { results } = await env.DB.prepare("SELECT * FROM UserItemData").all();
+    userItemData = results;
+  } catch (e) {}
+
   const dateCreated = new Date().toISOString();
   const backupData = {
-    version: 1,
+    version: 2,
     appName: "DriveFlin",
     dateCreated,
     stats: {
@@ -54,6 +68,8 @@ export async function createDatabaseBackup(env: any): Promise<any> {
       Items: items,
       Config: config,
       PlaybackProgress: progress,
+      Users: users,
+      UserItemData: userItemData,
     },
   };
 
@@ -61,11 +77,27 @@ export async function createDatabaseBackup(env: any): Promise<any> {
   const fileName = `DriveFlin_Backup_${dateCreated.slice(0, 19).replace(/[:T]/g, "-")}.json`;
   const backupId = "backup_" + Date.now();
 
-  // 1. Save to D1 database for instant reliability
-  await env.DB.prepare(`
-    INSERT OR REPLACE INTO Backups (Id, Name, DateCreated, Size, Data)
-    VALUES (?, ?, ?, ?, ?)
-  `).bind(backupId, fileName, dateCreated, jsonStr.length, jsonStr).run();
+  // 1. Cópia no D1 (melhor esforço: o D1 limita o tamanho de cada linha, então
+  //    bibliotecas grandes ficam só no Google Drive).
+  let savedInD1 = false;
+  try {
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO Backups (Id, Name, DateCreated, Size, Data)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(backupId, fileName, dateCreated, jsonStr.length, jsonStr).run();
+    savedInD1 = true;
+  } catch (e) {
+    try {
+      // Tabela criada pela v1 (colunas Timestamp/Filename obrigatórias)
+      await env.DB.prepare(`
+        INSERT OR REPLACE INTO Backups (Id, Timestamp, Filename, Name, DateCreated, Size, Data)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(backupId, dateCreated, fileName, fileName, dateCreated, jsonStr.length, jsonStr).run();
+      savedInD1 = true;
+    } catch (e2: any) {
+      console.warn("Backup não coube no D1, ficará só no Drive:", e2?.message || e2);
+    }
+  }
 
   // 2. Also attempt upload to Google Drive
   let gdriveFileId: string | null = null;
@@ -80,6 +112,9 @@ export async function createDatabaseBackup(env: any): Promise<any> {
     );
   } catch (err: any) {
     console.warn("Could not upload backup to Google Drive:", err.message);
+  }
+  if (!savedInD1 && !gdriveFileId) {
+    throw new Error("Backup failed: could not save to D1 nor Google Drive");
   }
 
   return {
@@ -104,7 +139,7 @@ export async function listDatabaseBackups(env: any): Promise<any[]> {
         Data TEXT
       )
     `).run();
-    const { results } = await env.DB.prepare("SELECT Id, Name, DateCreated, Size FROM Backups").all();
+    const { results } = await env.DB.prepare("SELECT Id, Name, DateCreated, Size FROM Backups WHERE Name IS NOT NULL").all();
     for (const b of (results || [])) {
       backupsMap.set(b.Name, {
         Path: b.Id,
@@ -179,67 +214,87 @@ export async function restoreDatabaseBackup(env: any, fileId: string): Promise<a
     throw new Error("Invalid backup file format");
   }
 
-  // Restore Libraries
-  if (backupData.tables.Libraries && Array.isArray(backupData.tables.Libraries)) {
-    for (const lib of backupData.tables.Libraries) {
-      await env.DB.prepare(`
-        INSERT OR REPLACE INTO Libraries (Id, Name, FolderId, CollectionType, PrimaryImageFileId)
-        VALUES (?, ?, ?, ?, ?)
+  // v2: tudo vira uma lista de comandos executados em lotes (db.batch). Isso respeita
+  // o limite de subrequisições do Worker e evita restaurações pela metade.
+  const db = env.DB;
+  const stmts: any[] = [];
+  const t = backupData.tables;
+
+  if (Array.isArray(t.Libraries)) {
+    for (const lib of t.Libraries) {
+      if (!lib || !lib.Id) continue;
+      stmts.push(db.prepare(`
+        INSERT OR REPLACE INTO Libraries (Id, Name, FolderId, CollectionType, PrimaryImageFileId, BackdropImageFileId, Uuid)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `).bind(
         lib.Id,
         lib.Name,
         lib.FolderId,
         lib.CollectionType || null,
-        lib.PrimaryImageFileId || null
-      ).run();
+        lib.PrimaryImageFileId || null,
+        lib.BackdropImageFileId || null,
+        lib.Uuid || null
+      ));
     }
   }
 
-  // Restore Items
   const validItemColumns = [
     "Id", "ParentId", "LibraryId", "Type", "Name", "Overview",
     "IndexNumber", "ParentIndexNumber", "FolderId", "FileId",
     "EncryptedName", "Size", "PrimaryImageFileId", "BackdropImageFileId",
-    "TmdbId", "MediaInfo", "DateCreated"
+    "TmdbId", "MediaInfo", "DateCreated", "Uuid"
   ];
-
-  if (backupData.tables.Items && Array.isArray(backupData.tables.Items)) {
-    for (const it of backupData.tables.Items) {
+  if (Array.isArray(t.Items)) {
+    for (const it of t.Items) {
+      if (!it) continue;
       const keys = Object.keys(it).filter((k) => validItemColumns.includes(k));
-      if (keys.length > 0) {
-        const placeholders = keys.map(() => "?").join(", ");
-        const values = keys.map((k) => it[k] ?? null);
-        await env.DB.prepare(`
-          INSERT OR REPLACE INTO Items (${keys.join(", ")})
-          VALUES (${placeholders})
-        `).bind(...values).run();
+      if (!keys.includes("Id")) continue;
+      const placeholders = keys.map(() => "?").join(", ");
+      stmts.push(db.prepare(`INSERT OR REPLACE INTO Items (${keys.join(", ")}) VALUES (${placeholders})`).bind(...keys.map((k) => it[k] ?? null)));
+    }
+  }
+
+  if (Array.isArray(t.Config)) {
+    for (const cfg of t.Config) {
+      if (!cfg || !cfg.Key) continue;
+      stmts.push(db.prepare("INSERT OR REPLACE INTO Config (Key, Value) VALUES (?, ?)").bind(cfg.Key, cfg.Value));
+    }
+  }
+
+  let restoredUsers = 0;
+  if (Array.isArray(t.Users)) {
+    for (const u of t.Users) {
+      if (!u || !u.Id || !u.Name) continue;
+      restoredUsers++;
+      if (u.Password === undefined || u.Password === null) {
+        // Sem senha no backup: atualiza só nome/política e mantém a senha atual.
+        stmts.push(db.prepare("UPDATE Users SET Name = ?, Policy = ?, Configuration = ? WHERE Id = ?")
+          .bind(u.Name, u.Policy ?? null, u.Configuration ?? null, u.Id));
+      } else {
+        stmts.push(db.prepare("INSERT OR REPLACE INTO Users (Id, Name, Password, Policy, Configuration) VALUES (?, ?, ?, ?, ?)")
+          .bind(u.Id, u.Name, String(u.Password), u.Policy ?? null, u.Configuration ?? null));
       }
     }
   }
 
-  // Restore Config
-  if (backupData.tables.Config && Array.isArray(backupData.tables.Config)) {
-    for (const cfg of backupData.tables.Config) {
-      await env.DB.prepare(`
-        INSERT OR REPLACE INTO Config (Key, Value) VALUES (?, ?)
-      `).bind(cfg.Key, cfg.Value).run();
+  if (Array.isArray(t.UserItemData)) {
+    for (const d of t.UserItemData) {
+      if (!d || !d.UserId || !d.ItemId) continue;
+      stmts.push(db.prepare(`
+        INSERT OR REPLACE INTO UserItemData (UserId, ItemId, PlaybackPositionTicks, Played, IsFavorite, LastPlayedDate)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(d.UserId, d.ItemId, d.PlaybackPositionTicks ?? 0, d.Played ?? 0, d.IsFavorite ?? 0, d.LastPlayedDate ?? null));
     }
   }
 
-  // Restore PlaybackProgress
-  if (backupData.tables.PlaybackProgress && Array.isArray(backupData.tables.PlaybackProgress)) {
-    for (const prog of backupData.tables.PlaybackProgress) {
-      await env.DB.prepare(`
-        INSERT OR REPLACE INTO PlaybackProgress (UserId, ItemId, PositionTicks, Played, LastPlayedDate)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(
-        prog.UserId,
-        prog.ItemId,
-        prog.PositionTicks,
-        prog.Played,
-        prog.LastPlayedDate || null
-      ).run();
-    }
+  for (let i = 0; i < stmts.length; i += 100) {
+    await db.batch(stmts.slice(i, i + 100));
+  }
+
+  if (restoredUsers > 0) {
+    // Sessões antigas deixam de valer após restaurar usuários.
+    try { await db.prepare("DELETE FROM Sessions").run(); } catch (e) {}
+    invalidateSessionCache();
   }
 
   return {
@@ -248,6 +303,8 @@ export async function restoreDatabaseBackup(env: any, fileId: string): Promise<a
       libraries: backupData.tables.Libraries?.length || 0,
       items: backupData.tables.Items?.length || 0,
       config: backupData.tables.Config?.length || 0,
+      users: restoredUsers,
+      userItemData: backupData.tables.UserItemData?.length || 0,
     },
   };
 }

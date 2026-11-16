@@ -313,7 +313,7 @@ export const oauthHtml = `<!DOCTYPE html>
 
       <div class="form-group">
         <label for="clientId">Client ID <span style="color: var(--accent);">*</span></label>
-        <input type="text" id="clientId" placeholder="ex: 1032237895629-xxxx.apps.googleusercontent.com">
+        <input type="text" id="clientId" placeholder="ex: 123456789012-xxxx.apps.googleusercontent.com">
       </div>
 
       <div class="form-group">
