@@ -8,7 +8,7 @@ directory = "public"
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMPOS EXIBIDOS NO MOMENTO DA INSTALAÇÃO (Cloudflare Workers & Pages).
 #
-# Estes oito campos aparecem no painel da Cloudflare durante a instalação.
+# Estes sete campos aparecem no painel da Cloudflare durante a instalação.
 # Eles permanecem aqui para que um novo usuário consiga fazer o setup.
 #
 # Deploys de manutenção devem usar "npm run deploy", que executa Wrangler
@@ -22,7 +22,6 @@ GDRIVE_CLIENT_SECRET = ""
 GDRIVE_REFRESH_TOKEN = ""
 GDRIVE_TEAM_DRIVE_ID = ""
 TMDB_API_KEY         = ""
-ADMIN_PASSWORD       = ""
 RCLONE_PASS          = ""
 RCLONE_SALT          = ""
 

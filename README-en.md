@@ -181,7 +181,6 @@ Once deployment finishes, add your Google Drive connection and optional settings
    | `GDRIVE_CLIENT_SECRET` | Secret | Client Secret generated in the Google Cloud Console. |
    | `GDRIVE_REFRESH_TOKEN` | Secret | Refresh Token generated at [generator.driveflin.org](https://generator.driveflin.org). |
    | `TMDB_API_KEY` | Secret | *(Optional)* Your personal [TheMovieDB](https://www.themoviedb.org/settings/api) API key. DriveFlin already includes a working default key built-in, but you may supply your own. |
-   | `ADMIN_PASSWORD` | Secret | *(Optional)* Admin password. If omitted, defaults to `admin`. |
    | `GDRIVE_TEAM_DRIVE_ID` | Secret | *(Optional)* Google Shared/Team Drive ID (leave blank if using personal My Drive). |
    | `RCLONE_PASS` | Secret | *(Optional)* Password if your Google Drive files use Rclone Crypt. |
    | `RCLONE_SALT` | Secret | *(Optional)* Salt if your Google Drive files use Rclone Crypt. |
@@ -195,7 +194,7 @@ Once deployment finishes, add your Google Drive connection and optional settings
    `https://driveflin.your-subdomain.workers.dev/web/index.html`
 2. **Automatic Initial Login:**
    - **Username:** `admin`
-   - **Password:** `admin`
+   - **Password:** `admin` *(recommended to change later inside the Jellyfin Dashboard under Users)*
 3. Open the **Dashboard** (User avatar icon > Dashboard) > **Libraries**.
 4. Click **+ Add Media Library**, select your content type (Movies, TV Shows, or Music), and pick your Google Drive folders directly through the visual folder browser!
 

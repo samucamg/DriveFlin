@@ -12,3 +12,5 @@ TMDB_API_KEY="your_tmdb_api_key_here"
 # Optional: Rclone Crypt password and salt if media files have encrypted names
 RCLONE_PASS=""
 RCLONE_SALT=""
+
+# Default initial Jellyfin login: admin / admin (change it inside Jellyfin Dashboard)

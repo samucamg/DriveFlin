@@ -181,7 +181,6 @@ Após a implantação, adicione a sua conexão do Google Drive e personalizaçõ
    | `GDRIVE_CLIENT_SECRET` | Secret | Client Secret obtido no Google Cloud Console. |
    | `GDRIVE_REFRESH_TOKEN` | Secret | Refresh Token obtido em [generator.driveflin.org](https://generator.driveflin.org). |
    | `TMDB_API_KEY` | Secret | *(Opcional)* Sua chave pessoal do [TheMovieDB](https://www.themoviedb.org/settings/api). O DriveFlin já possui uma chave funcional embutida de fábrica, mas você pode usar a sua própria se preferir. |
-   | `ADMIN_PASSWORD` | Secret | *(Opcional)* Senha do admin. Se omitido, o padrão é `admin`. |
    | `GDRIVE_TEAM_DRIVE_ID` | Secret | *(Opcional)* ID do Drive Compartilhado (Shared/Team Drive). |
    | `RCLONE_PASS` | Secret | *(Opcional)* Senha caso seus arquivos usem Rclone Crypt. |
    | `RCLONE_SALT` | Secret | *(Opcional)* Salt caso seus arquivos usem Rclone Crypt. |
@@ -195,7 +194,7 @@ Após a implantação, adicione a sua conexão do Google Drive e personalizaçõ
    `https://driveflin.seu-subdominio.workers.dev/web/index.html`
 2. **Login Inicial Automático:**
    - **Usuário:** `admin`
-   - **Senha:** `admin`
+   - **Senha:** `admin` *(recomendado alterar depois dentro do próprio painel do Jellyfin em Usuários)*
 3. Vá em **Painel de Controle** (ícone de usuário > Painel) > **Bibliotecas**.
 4. Clique em **+ Adicionar Biblioteca de Mídia**, selecione a categoria (Filmes, Séries ou Música) e selecione diretamente sua pasta do Google Drive pelo navegador visual!
 

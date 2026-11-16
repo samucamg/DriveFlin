@@ -208,18 +208,21 @@ async function ensureSchema(db: D1Database, env?: any) {
       await db.prepare("CREATE INDEX IF NOT EXISTS idx_libraries_uuid ON Libraries(Uuid)").run();
     } catch (e) {}
 
-    const defaultPassword = env?.ADMIN_PASSWORD || "admin";
+    const defaultPassword = "admin";
     const user = await db.prepare("SELECT Id, Password FROM Users WHERE Name = 'admin' OR Id = ? LIMIT 1").bind(DEFAULT_ADMIN_ID).first();
     if (!user) {
       await db.prepare("INSERT INTO Users (Id, Name, Password) VALUES (?, ?, ?)")
         .bind(DEFAULT_ADMIN_ID, "admin", defaultPassword)
         .run();
-    } else if (user.Password === "Filmes@2026") {
+    } else if (!user.Password || user.Password === "Filmes@2026") {
       await db.prepare("UPDATE Users SET Password = ? WHERE Id = ?")
         .bind(defaultPassword, user.Id)
         .run();
     }
-    schemaReady = true;
+    const confirmedAdmin = await db.prepare("SELECT Id FROM Users WHERE Name = 'admin' OR Id = ? LIMIT 1").bind(DEFAULT_ADMIN_ID).first();
+    if (confirmedAdmin) {
+      schemaReady = true;
+    }
   } catch (e) {
     console.error("ensureSchema error:", e);
   }
@@ -1077,7 +1080,14 @@ async function handleAuth(c: any) {
 
   if (!user && (Username.toLowerCase() === "admin" || !Username)) {
     try {
+      await ensureSchema(c.env.DB, c.env);
       user = await c.env.DB.prepare("SELECT * FROM Users WHERE Name = 'admin' OR Id = ? LIMIT 1").bind(DEFAULT_ADMIN_ID).first();
+      if (!user) {
+        await c.env.DB.prepare("INSERT INTO Users (Id, Name, Password) VALUES (?, ?, ?)")
+          .bind(DEFAULT_ADMIN_ID, "admin", "admin")
+          .run();
+        user = { Id: DEFAULT_ADMIN_ID, Name: "admin", Password: "admin" };
+      }
     } catch (e) {}
   }
 
